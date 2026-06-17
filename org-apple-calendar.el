@@ -594,24 +594,34 @@ if(granted){
     ev.endDate=$.NSDate.dateWithTimeIntervalSince1970(%f);
     ev.allDay=%s;
     var notes=%s;if(notes){ev.notes=notes;}
+    var rfreq=%d,rint=%d;
+    if(rfreq>=0){ev.addRecurrenceRule($.EKRecurrenceRule.alloc.initRecurrenceWithFrequencyIntervalEnd(rfreq,rint,$()));}
     if(store.saveEventSpanError(ev,0,$())){res.ok=true;res.uid=ObjC.unwrap(ev.eventIdentifier);}
     else{res.err='save-failed';}
   }
 }
 JSON.stringify({granted:granted,result:res});"
-  "JXA template: %d iters, then %s target, %s title, %f start, %f end, %s allDay, %s notes.")
+  "JXA template: %d iters, %s target, %s title, %f start, %f end, %s allDay,
+%s notes, %d recurrence frequency (-1 = none; 0/1/2/3 = daily/weekly/monthly/
+yearly), %d recurrence interval.")
 
-(defun org-apple-calendar--eventkit-create-event (title start end all-day notes)
+(defun org-apple-calendar--eventkit-create-event (title start end all-day notes
+                                                        &optional recurrence)
   "Create an event in `org-apple-calendar-target-calendar' via EventKit.
-START/END are epoch seconds. Return plist with :uid on success or :error."
-  (let* ((script (format org-apple-calendar--create-script-template
+START/END are epoch seconds. RECURRENCE is a plist (:freq daily|weekly|monthly|
+yearly :interval N) or nil. Return plist with :uid on success or :error."
+  (let* ((rfreq (pcase (plist-get recurrence :freq)
+                  ('daily 0) ('weekly 1) ('monthly 2) ('yearly 3) (_ -1)))
+         (rint (or (plist-get recurrence :interval) 1))
+         (script (format org-apple-calendar--create-script-template
                          (* 10 org-apple-calendar-access-timeout)
                          (json-encode org-apple-calendar-target-calendar)
                          (json-encode (or title "(Termin)"))
                          (float start) (float end)
                          (if all-day "true" "false")
                          (if (and notes (not (string-empty-p notes)))
-                             (json-encode notes) "null")))
+                             (json-encode notes) "null")
+                         rfreq rint))
          (data (org-apple-calendar--jxa-run-json script))
          (res (alist-get 'result data)))
     (cond
@@ -619,9 +629,23 @@ START/END are epoch seconds. Return plist with :uid on success or :error."
      ((alist-get 'uid res) (list :uid (alist-get 'uid res)))
      (t (list :error (or (alist-get 'err res) "unknown"))))))
 
+(defun org-apple-calendar--timestamp-recurrence (ts)
+  "Return a recurrence plist (:freq :interval) for org timestamp TS, or nil.
+Maps the org repeater unit to an EKRecurrenceRule frequency. Hour repeaters
+are unsupported (EKRecurrenceRule has no sub-day frequency)."
+  (when (org-element-property :repeater-type ts)
+    (let ((val (or (org-element-property :repeater-value ts) 1))
+          (unit (org-element-property :repeater-unit ts)))
+      (pcase unit
+        ('day   (list :freq 'daily :interval val))
+        ('week  (list :freq 'weekly :interval val))
+        ('month (list :freq 'monthly :interval val))
+        ('year  (list :freq 'yearly :interval val))
+        (_ nil)))))
+
 (defun org-apple-calendar--entry-appointment ()
   "Return a plist for the appointment at point, or nil when it has no timestamp.
-Plist: :title :start :end (epoch) :all-day :notes."
+Plist: :title :start :end (epoch) :all-day :notes :recurrence."
   (let ((tsstr (org-entry-get nil "TIMESTAMP")))
     (when tsstr
       (let* ((ts (org-timestamp-from-string tsstr))
@@ -630,7 +654,8 @@ Plist: :title :start :end (epoch) :all-day :notes."
              (end (float-time (org-timestamp-to-time ts t))))
         (when (and (not all-day) (<= end start)) (setq end (+ start 3600)))
         (list :title (org-get-heading t t t t)
-              :start start :end end :all-day all-day :notes nil)))))
+              :start start :end end :all-day all-day :notes nil
+              :recurrence (org-apple-calendar--timestamp-recurrence ts))))))
 
 (defun org-apple-calendar--event-at-point ()
   "Return the Apple calendar event represented at point.
@@ -793,7 +818,7 @@ On success the heading is linked (idempotent). Update/delete come later."
               (let ((res (org-apple-calendar--eventkit-create-event
                           (plist-get appt :title) (plist-get appt :start)
                           (plist-get appt :end) (plist-get appt :all-day)
-                          (plist-get appt :notes))))
+                          (plist-get appt :notes) (plist-get appt :recurrence))))
                 (if (plist-get res :uid)
                     (progn
                       (org-set-property "APPLE_EVENT_ID" (plist-get res :uid))

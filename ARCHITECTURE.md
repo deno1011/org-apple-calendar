@@ -109,6 +109,14 @@ The **read + ingest layers are backend-agnostic** (reading is always EventKit)
 and are built first. Only L5's write dispatch and an `eventkit`/`caldav`
 implementation differ between backends.
 
+**Recurrence (EventKit write, done 2026-06-17):** simple org repeaters
+(`+Nd/+Nw/+Nm/+Ny`) map to an `EKRecurrenceRule` (frequency + interval, no end)
+via `--timestamp-recurrence`; `push-appointments` carries it through. The JXA
+must use `ev.addRecurrenceRule(rule)` (assigning `recurrenceRules = [rule]`
+raises an unrecognized-selector error in JXA). Hour repeaters and weekday/sexp
+patterns are unsupported → keep those native in Apple. Covered by the `ert`
+suite (parsing + script generation; live smoke-tested).
+
 ## Cross-cutting rules (authoritative)
 
 1. Single writer = the "Org" iCloud calendar.
