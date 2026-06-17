@@ -195,5 +195,122 @@ Timed events count as busy; all-day events are ignored."
         (goto-char (point-min)) (view-mode 1)))
     (display-buffer buf)))
 
+(defcustom org-apple-calendar-day-window '(9 . 21)
+  "Daily availability window as (START-HOUR . END-HOUR), local time."
+  :type '(cons integer integer) :group 'org-apple-calendar)
+
+(defun org-apple-calendar--day-floor (epoch)
+  "Return local-midnight epoch for the day containing EPOCH (a float)."
+  (let ((d (decode-time (seconds-to-time epoch))))
+    (float-time (encode-time 0 0 0 (decoded-time-day d)
+                             (decoded-time-month d) (decoded-time-year d)))))
+
+(defun org-apple-calendar-free-slots (start end &optional min-minutes)
+  "Return free slots (list of (BEG . END) Emacs-time pairs) in [START,END].
+Each slot lies inside the daily `org-apple-calendar-day-window', is at least
+MIN-MINUTES long (default 30), starts no earlier than now, and avoids busy
+intervals from `org-apple-calendar-free-busy'."
+  (let* ((min-secs (* 60 (or min-minutes 30)))
+         (busy (mapcar (lambda (b) (cons (float-time (car b)) (float-time (cdr b))))
+                       (org-apple-calendar-free-busy start end)))
+         (now (float-time))
+         (ws (car org-apple-calendar-day-window))
+         (we (cdr org-apple-calendar-day-window))
+         (e (float-time end))
+         (day (org-apple-calendar--day-floor (float-time start)))
+         (slots '()))
+    (while (< day e)
+      (let ((ds (max now (+ day (* 3600 ws))))
+            (de (min e (+ day (* 3600 we))))
+            (cursor nil))
+        (when (< ds de)
+          (setq cursor ds)
+          (dolist (b busy)
+            (let ((bs (car b)) (be (cdr b)))
+              (when (and (< bs de) (> be ds))      ; overlaps this day window
+                (when (and (> bs cursor) (>= (- bs cursor) min-secs))
+                  (push (cons cursor bs) slots))
+                (setq cursor (max cursor be)))))
+          (when (and (< cursor de) (>= (- de cursor) min-secs))
+            (push (cons cursor de) slots))))
+      (setq day (+ day 86400)))
+    (nreverse (mapcar (lambda (s) (cons (seconds-to-time (car s))
+                                        (seconds-to-time (cdr s))))
+                      slots))))
+
+(defun org-apple-calendar-show-free-slots (&optional days min-minutes)
+  "Display free slots for the next DAYS (default 7), each >= MIN-MINUTES (60)."
+  (interactive)
+  (let* ((days (or days 7))
+         (min-minutes (or min-minutes 60))
+         (start (current-time))
+         (end (time-add start (days-to-time days)))
+         (slots (org-apple-calendar-free-slots start end min-minutes))
+         (buf (get-buffer-create "*Apple Calendar — Free*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Free slots — next %d days, >= %d min, window %d:00-%d:00\n"
+                        days min-minutes (car org-apple-calendar-day-window)
+                        (cdr org-apple-calendar-day-window)))
+        (insert (make-string 56 ?-) "\n")
+        (dolist (sl slots)
+          (insert (format "%s  %s–%s  (%d min)\n"
+                          (format-time-string "%a %d.%m." (car sl))
+                          (format-time-string "%H:%M" (car sl))
+                          (format-time-string "%H:%M" (cdr sl))
+                          (round (/ (float-time (time-subtract (cdr sl) (car sl))) 60)))))
+        (goto-char (point-min)) (view-mode 1)))
+    (display-buffer buf)
+    slots))
+
+(defcustom org-apple-calendar-mirror-file
+  (expand-file-name "org-apple-calendar/calendar-mirror.org" user-emacs-directory)
+  "Path of the regenerable read-only org mirror of Apple calendars."
+  :type 'file :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-mirror-days 30
+  "How many days ahead to mirror."
+  :type 'integer :group 'org-apple-calendar)
+
+(defun org-apple-calendar--event-timestamp (ev)
+  "Return an org active timestamp string for event EV."
+  (if (plist-get ev :all-day)
+      (format-time-string "<%Y-%m-%d %a>" (plist-get ev :start))
+    (let ((bs (plist-get ev :start)) (be (plist-get ev :end)))
+      (if (string= (format-time-string "%Y-%m-%d" bs)
+                   (format-time-string "%Y-%m-%d" be))
+          (concat (format-time-string "<%Y-%m-%d %a %H:%M" bs)
+                  (format-time-string "-%H:%M>" be))
+        (concat (format-time-string "<%Y-%m-%d %a %H:%M>--" bs)
+                (format-time-string "<%Y-%m-%d %a %H:%M>" be))))))
+
+(defun org-apple-calendar-refresh-mirror (&optional days)
+  "Regenerate `org-apple-calendar-mirror-file' for the next DAYS and add it to
+`org-agenda-files'. Returns the event count."
+  (interactive)
+  (let* ((days (or days org-apple-calendar-mirror-days))
+         (start (current-time))
+         (end (time-add start (days-to-time days)))
+         (evs (sort (org-apple-calendar-fetch-events start end)
+                    (lambda (a b) (time-less-p (plist-get a :start)
+                                               (plist-get b :start)))))
+         (file org-apple-calendar-mirror-file))
+    (make-directory (file-name-directory file) t)
+    (with-temp-file file
+      (insert "#+TITLE: Apple Calendar (read-only mirror)\n"
+              "#+STARTUP: overview\n"
+              "# AUTO-GENERATED by org-apple-calendar — do not edit (overwritten on refresh).\n"
+              "# Visibility only. Create appointments in calendar.org, not here.\n\n")
+      (dolist (ev evs)
+        (insert (format "* %s\n  %s\n  :PROPERTIES:\n  :CALENDAR: %s\n  :END:\n"
+                        (or (plist-get ev :title) "(ohne Titel)")
+                        (org-apple-calendar--event-timestamp ev)
+                        (or (plist-get ev :calendar) "")))))
+    (add-to-list 'org-agenda-files file)
+    (when (called-interactively-p 'any)
+      (message "Calendar mirror: %d events → %s" (length evs) file))
+    (length evs)))
+
 (provide 'org-apple-calendar)
 ;;; org-apple-calendar.el ends here
