@@ -12,14 +12,15 @@ mirrors to Apple on macOS. It is the sibling of
 > Status: **design phase.** This repo holds the architecture and rules;
 > implementation follows the layered model in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 >
-> **Decision (2026-06-17): all via EventKit/JXA, drop `org-caldav`.** The
-> CalDAV+iCloud+`url.el` path proved fragile (see *Known risks*) and would need
-> a maintained fork + async-reconciled auto-patching. EventKit gives one
-> credential-free stack for both read and write — consistent with
-> `org-apple-reminders`. The interim `org-caldav` config in `emacs-mac-setup`
-> (`modules/55_calendar.org` + `local.org`) is **superseded** and will be
-> retired once the EventKit write path lands. Build order: read layers first
-> (L1/L2), then ingest, then the EventKit write path.
+> **Decision (2026-06-17): pluggable write backend — EventKit default, CalDAV
+> optional.** `org-apple-calendar-write-backend` selects `'eventkit` (default:
+> local, credential-free, robust) or `'caldav` (optional: server-side sync via
+> `org-caldav`, with its iCloud `url.el` fragility left to that user to tune —
+> see *Known risks*). Reading is always EventKit and backend-agnostic. Build
+> order: read layers (L1/L2) → ingest → EventKit write backend (caldav stays
+> available behind the same interface). The interim `org-caldav` config in
+> `emacs-mac-setup` (`modules/55_calendar.org` + `local.org`) becomes the
+> optional `'caldav` backend's wiring.
 
 ## Why
 
@@ -66,19 +67,20 @@ task deadlines. This keeps it uncluttered and trustworthy.
 
 ## Components
 
-One mechanism — **EventKit/JXA**, the same local, credential-free pattern as
-`org-apple-reminders` — for both directions:
+**Read** is always **EventKit/JXA** (local, credential-free, same pattern as
+`org-apple-reminders`). **Write** is a **pluggable backend**:
 
-1. **Read + ingest — all calendars.** Read every calendar for availability and
-   read-only agenda display; ingest deadline-like external events into GTD tasks.
-2. **Write — appointments.** Create/update events in the dedicated "Org"
-   calendar from `calendar.org`. (EventKit write path; built after the read
-   layers.)
+1. **Read + ingest — all calendars** (EventKit, backend-agnostic). Read every
+   calendar for availability and read-only agenda display; ingest deadline-like
+   external events into GTD tasks.
+2. **Write — appointments** to the dedicated "Org" calendar from `calendar.org`,
+   via the selected backend:
+   - `'eventkit` (default) — local, no credentials.
+   - `'caldav` (optional) — `org-caldav`, for server-side multi-device sync;
+     the user tunes its iCloud `url.el` quirks themselves.
 
-> Retired: `org-caldav` (CalDAV over `url.el`). It was the interim write path;
-> dropped per the decision above. Recurrence, all-day vs timed, and timezones
-> are the real work of the EventKit write path and are called out in
-> `ARCHITECTURE.md`.
+Recurrence, all-day vs timed, and timezones are the real work of the EventKit
+write backend and are called out in `ARCHITECTURE.md`.
 
 ## Relationship to the GTD setup
 

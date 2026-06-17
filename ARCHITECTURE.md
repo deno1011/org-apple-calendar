@@ -67,8 +67,10 @@ L1  Primitives     JXA/EventKit transport (run script -> JSON); defcustoms
   user confirms (first; auto for high-confidence patterns later) → `--ensure-gtd-task`.
 - **Availability:** `(free-slots START END MIN-DURATION)` from free/busy, for
   planning study/work blocks (e.g. around Einsendeaufgaben deadlines).
-- **Write boundary:** this package never writes to Apple calendars; appointment
-  writes go through the configured write path (org-caldav today).
+- **Write dispatch:** appointment writes go through
+  `org-apple-calendar-write-backend` — `'eventkit` (this package's EventKit
+  writer) or `'caldav` (delegates to `org-caldav`). Reading never writes; only
+  the dedicated "Org" calendar is ever written.
 
 ### L6 — Surface
 - Commands: refresh, ingest-deadlines, show-free-slots, jump-to-source-event.
@@ -86,14 +88,26 @@ L1  Primitives     JXA/EventKit transport (run script -> JSON); defcustoms
 | Maturity | community tool, but **fragile on iCloud** (see Known risks) | must be built; recurrence/timezones are real work |
 | Consistency w/ reminders | different stack | **same stack** as `org-apple-reminders` |
 
-**DECIDED (2026-06-17): EventKit write path; `org-caldav` retired.** Keeping
-`org-caldav` would mean maintaining a fork for the `DAV:status ""` bug and
-auto-applying it *after* elpaca's async install — fragile and ongoing toil.
-EventKit removes that entire class of problem (no third-party package, no
-CalDAV, no `url.el`, no credentials) and unifies the stack with
-`org-apple-reminders`. Cost we accept: building event write ourselves
-(recurrence, all-day vs timed, timezones, alarms). The read+ingest layers are
-unaffected and are built first.
+**DECIDED (2026-06-17): pluggable write backend — EventKit default, CalDAV
+optional.** The write path is an abstraction (L5) with selectable backends:
+
+```
+org-apple-calendar-write-backend  =  'eventkit  (default)  |  'caldav  (optional)
+```
+
+- **Default `eventkit`:** local, credential-free, robust; unifies the stack
+  with `org-apple-reminders`. Cost: we implement event write ourselves
+  (recurrence, all-day vs timed, timezones, alarms).
+- **Optional `caldav`:** keeps `org-caldav` available for server-side
+  multi-device sync without Calendar.app. Its iCloud fragility (preemptive
+  auth — see Known risks; `DAV:status ""` parse bug) is the *caldav user's*
+  concern to tune (url.el tweaks); the default path does not depend on it. Not
+  a version regression — the friction lives in `url.el`/`url-dav`, so chasing an
+  older `org-caldav` tag is not expected to help.
+
+The **read + ingest layers are backend-agnostic** (reading is always EventKit)
+and are built first. Only L5's write dispatch and an `eventkit`/`caldav`
+implementation differ between backends.
 
 ## Cross-cutting rules (authoritative)
 
