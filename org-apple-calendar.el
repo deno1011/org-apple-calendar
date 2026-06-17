@@ -447,16 +447,44 @@ intervals from `org-apple-calendar-free-busy'."
       (dolist (ev evs)
         (let ((role (org-apple-calendar--event-role ev)))
           (unless (eq role 'ignore)
-            (insert (format "* %s%s\n  %s\n  :PROPERTIES:\n  :CALENDAR: %s\n  :APPLE_EVENT_UID: %s\n  :END:\n"
+            (insert (format "* %s%s\n  :PROPERTIES:\n  :CALENDAR: %s\n  :APPLE_EVENT_UID: %s\n  :END:\n  %s\n"
                             (or (plist-get ev :title) "(ohne Titel)")
                             (if (eq role 'info) " :info:" "")
-                            (org-apple-calendar--event-timestamp ev)
                             (or (plist-get ev :calendar) "")
-                            (or (plist-get ev :uid) "")))))))
+                            (or (plist-get ev :uid) "")
+                            (org-apple-calendar--event-timestamp ev)))))))
     (add-to-list 'org-agenda-files file)
     (when (called-interactively-p 'any)
       (message "Calendar mirror: %d events → %s" (length evs) file))
     (length evs)))
+
+;; -- Idle auto-refresh (read-only; the write sync stays manual) --------------
+
+(defcustom org-apple-calendar-auto-refresh-interval nil
+  "Idle seconds before auto-refreshing the read-only mirror; nil disables.
+Only the read-only mirror is refreshed automatically (safe). The two-way write
+sync (`org-apple-calendar-sync-appointments') stays manual on purpose."
+  :type '(choice (const :tag "off" nil) integer) :group 'org-apple-calendar)
+
+(defvar org-apple-calendar--auto-timer nil
+  "Idle timer object for the mirror auto-refresh.")
+
+(defun org-apple-calendar--auto-refresh-tick ()
+  "Refresh the mirror when configured; never signals."
+  (when org-apple-calendar-mirror-file
+    (ignore-errors (org-apple-calendar-refresh-mirror))))
+
+(defun org-apple-calendar-setup-auto-refresh ()
+  "Start or restart the idle mirror-refresh timer per the interval defcustom."
+  (interactive)
+  (when (timerp org-apple-calendar--auto-timer)
+    (cancel-timer org-apple-calendar--auto-timer))
+  (setq org-apple-calendar--auto-timer nil)
+  (when (and (integerp org-apple-calendar-auto-refresh-interval)
+             (> org-apple-calendar-auto-refresh-interval 0))
+    (setq org-apple-calendar--auto-timer
+          (run-with-idle-timer org-apple-calendar-auto-refresh-interval t
+                               #'org-apple-calendar--auto-refresh-tick))))
 
 (defcustom org-apple-calendar-ingest-calendars 'read-only
   "Which calendars feed the deadline ingest.
