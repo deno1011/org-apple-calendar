@@ -104,13 +104,17 @@ Signals a `user-error' if Calendar access is not granted."
          (data (org-apple-calendar--jxa-run-json script)))
     (unless (eq (alist-get 'granted data) t)
       (user-error "Calendar access not granted (approve the macOS prompt for Emacs)"))
-    (mapcar (lambda (c)
-              (list :title (alist-get 'title c)
-                    :id (alist-get 'id c)
-                    :writable (eq (alist-get 'writable c) t)
-                    :type (org-apple-calendar--type-label (alist-get 'type c))
-                    :source (alist-get 'source c)))
-            (alist-get 'calendars data))))
+    (let ((cals (mapcar (lambda (c)
+                          (list :title (alist-get 'title c)
+                                :id (alist-get 'id c)
+                                :writable (eq (alist-get 'writable c) t)
+                                :type (org-apple-calendar--type-label (alist-get 'type c))
+                                :source (alist-get 'source c)))
+                        (alist-get 'calendars data))))
+      ;; First access auto-creates the per-user classification listing ALL
+      ;; calendars (default busy); later calls append any new ones.
+      (org-apple-calendar--sync-classification cals)
+      cals)))
 
 (defun org-apple-calendar-show-calendars ()
   "Display all Apple calendars classified as owned (writable) vs read-only."
@@ -302,10 +306,12 @@ The override is the safety net when Apple's classification is wrong.
   "Effective role of EV: `busy', `info', or `ignore'.
 Priority: per-event override > ignore/info calendar policy > Apple
 availability (Free ⇒ info) > default busy."
-  (let ((ovr (cdr (assoc (plist-get ev :uid) (org-apple-calendar--load-overrides))))
-        (cal (plist-get ev :calendar)))
+  (let* ((ovr (cdr (assoc (plist-get ev :uid) (org-apple-calendar--load-overrides))))
+         (cal (plist-get ev :calendar))
+         (cls (cdr (assoc cal (org-apple-calendar--load-classification)))))
     (cond
-     (ovr ovr)
+     (ovr ovr)                                       ; per-event override
+     (cls cls)                                        ; per-calendar policy file
      ((member cal org-apple-calendar-ignore-calendars) 'ignore)
      ((member cal org-apple-calendar-info-calendars) 'info)
      ((eql (plist-get ev :availability) 1) 'info)   ; EKEventAvailabilityFree
@@ -329,6 +335,67 @@ property). Choosing \"clear\" removes the override."
     (org-apple-calendar-set-event-role uid role)
     (message "Rolle gesetzt: %s — View neu laden (C-c k u / m) zum Aktualisieren"
              (or role "default"))))
+#+end_src
+
+* L3 — Per-user calendar classification
+
+The per-calendar busy/info/ignore policy is **personal data**, not package
+config: it is kept in `org-apple-calendar-classification-file` (point it at your
+private, encrypted data area). On first calendar access the file is **created
+listing all your calendars** (default role `busy`); new calendars are added
+automatically over time. You edit the roles; existing roles are never clobbered.
+This keeps real calendar names out of any shared config.
+
+#+begin_src emacs-lisp :tangle yes
+(defcustom org-apple-calendar-classification-file nil
+  "File mapping each calendar title to a role: an alist (NAME . busy|info|ignore).
+Keep it in your private/encrypted data area. Auto-populated with all calendars
+on first access; nil disables the per-calendar policy file."
+  :type '(choice (const nil) file) :group 'org-apple-calendar)
+
+(defvar org-apple-calendar--classification 'unset
+  "Cached classification alist; `unset' until first load.")
+
+(defun org-apple-calendar--load-classification ()
+  "Load and cache the per-calendar classification alist."
+  (when (eq org-apple-calendar--classification 'unset)
+    (setq org-apple-calendar--classification
+          (when (and org-apple-calendar-classification-file
+                     (file-exists-p org-apple-calendar-classification-file))
+            (with-temp-buffer
+              (insert-file-contents org-apple-calendar-classification-file)
+              (ignore-errors (read (current-buffer)))))))
+  org-apple-calendar--classification)
+
+(defun org-apple-calendar--save-classification (alist)
+  "Persist the classification ALIST."
+  (when org-apple-calendar-classification-file
+    (make-directory (file-name-directory org-apple-calendar-classification-file) t)
+    (with-temp-file org-apple-calendar-classification-file
+      (insert ";; org-apple-calendar: calendar title -> role (busy|info|ignore).\n"
+              ";; Edit roles freely; new calendars are appended as `busy'.\n")
+      (prin1 alist (current-buffer))
+      (insert "\n"))
+    (setq org-apple-calendar--classification alist)))
+
+(defun org-apple-calendar--sync-classification (cals)
+  "Append any calendars in CALS missing from the classification file as `busy'."
+  (when org-apple-calendar-classification-file
+    (let ((cur (copy-alist (org-apple-calendar--load-classification)))
+          (changed nil))
+      (dolist (c cals)
+        (let ((name (plist-get c :title)))
+          (unless (assoc name cur) (push (cons name 'busy) cur) (setq changed t))))
+      (when changed (org-apple-calendar--save-classification cur)))))
+
+(defun org-apple-calendar-init-classification ()
+  "Ensure every calendar appears in the classification file, then open it.
+New calendars are added as `busy'; existing roles are preserved."
+  (interactive)
+  (unless org-apple-calendar-classification-file
+    (user-error "Set `org-apple-calendar-classification-file' first"))
+  (org-apple-calendar--sync-classification (org-apple-calendar-list-calendars))
+  (find-file org-apple-calendar-classification-file))
 #+end_src
 
 * L3 — Availability (free slots)
