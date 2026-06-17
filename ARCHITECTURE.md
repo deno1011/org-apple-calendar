@@ -156,6 +156,28 @@ calendars you cannot fix classification at the source, and maintaining correct
 "Show As" on every event by hand is unrealistic — so the GTD side must be able
 to overrule, cheaply, per event, and have it persist across re-fetches.
 
+## Event adoption (external event → Org hard landscape)
+
+The mirror is the AI/GTD intake layer; `calendar.org` is the writable personal
+hard landscape. When a mirrored external event should also be visible in Apple
+Calendar with only the "Org" calendar enabled, adoption makes that explicit:
+
+1. Read the event at point from the upcoming buffer (`apple-event` text
+   property) or the mirror heading (`APPLE_EVENT_UID`, `CALENDAR`, timestamp).
+2. Create a new EventKit event in `org-apple-calendar-target-calendar`.
+3. Append a linked appointment to `org-apple-calendar-source-file` with
+   `ADOPTED_FROM_CALENDAR`, `ADOPTED_FROM_UID`, `ADOPTED_FROM_KEY`,
+   `APPLE_EVENT_ID`, and `APPLE_CALENDAR`.
+4. Persist an `ignore` override for the source UID so the regenerated mirror
+   shows the Org-owned copy rather than duplicating the external source.
+5. Refresh the mirror.
+
+`ADOPTED_FROM_KEY` includes the source UID and occurrence start time, so one
+source event occurrence is not adopted twice. If a source event is recurring and
+Apple exposes the recurrence with one UID, the `ignore` override applies to all
+mirror occurrences represented by that UID; adopt recurring commitments
+deliberately.
+
 ## Known risks (snapshot, see README for detail)
 - org-caldav + iCloud + url.el: needs preemptive Basic auth; `org-caldav-check-connection`
   yields `DAV:status ""` (open).

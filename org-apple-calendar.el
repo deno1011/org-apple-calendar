@@ -205,7 +205,8 @@ Timed events count as busy; all-day events are ignored."
                                (truncate-string-to-width (or (plist-get ev :calendar) "") 20)
                                (or (plist-get ev :title) "")
                                (if (plist-get ev :recurring) " ↻" ""))
-                       'apple-uid (plist-get ev :uid))))))
+                       'apple-uid (plist-get ev :uid)
+                       'apple-event ev)))))
         (goto-char (point-min)) (view-mode 1)))
     (display-buffer buf)))
 
@@ -630,6 +631,117 @@ Plist: :title :start :end (epoch) :all-day :notes."
         (when (and (not all-day) (<= end start)) (setq end (+ start 3600)))
         (list :title (org-get-heading t t t t)
               :start start :end end :all-day all-day :notes nil)))))
+
+(defun org-apple-calendar--event-at-point ()
+  "Return the Apple calendar event represented at point.
+Works in `org-apple-calendar-upcoming' buffers via text properties and in the
+read-only org mirror via heading/timestamp/properties."
+  (or (get-text-property (point) 'apple-event)
+      (and (derived-mode-p 'org-mode)
+           (save-excursion
+             (org-back-to-heading t)
+             (let* ((title (org-get-heading t t t t))
+                    (end (save-excursion (org-end-of-subtree t t)))
+                    uid cal tsstr)
+               (save-excursion
+                 (when (re-search-forward org-ts-regexp end t)
+                   (setq tsstr (match-string 0)))
+                 (goto-char (line-beginning-position))
+                 (while (and (not (and uid cal))
+                             (re-search-forward
+                              "^[ \t]*:\\(APPLE_EVENT_UID\\|CALENDAR\\):[ \t]*\\(.*\\)$"
+                              end t))
+                   (pcase (match-string 1)
+                     ("APPLE_EVENT_UID" (setq uid (string-trim (match-string 2))))
+                     ("CALENDAR" (setq cal (string-trim (match-string 2)))))))
+               (when (and uid tsstr)
+                 (let* ((ts (org-timestamp-from-string tsstr))
+                        (all-day (not (org-element-property :hour-start ts)))
+                        (start (org-timestamp-to-time ts))
+                        (ev-end (org-timestamp-to-time ts t)))
+                   (when (and (not all-day)
+                              (<= (float-time ev-end) (float-time start)))
+                     (setq ev-end (time-add start (seconds-to-time 3600))))
+                   (list :title title :start start :end ev-end :all-day all-day
+                         :calendar cal :uid uid :notes nil))))))))
+
+(defun org-apple-calendar--adopt-key (ev)
+  "Return a stable source-occurrence key for adopted event EV."
+  (format "%s@%d" (or (plist-get ev :uid) "")
+          (floor (float-time (plist-get ev :start)))))
+
+(defun org-apple-calendar--source-file-contains-key-p (key)
+  "Non-nil when `org-apple-calendar-source-file' already contains KEY."
+  (and org-apple-calendar-source-file
+       (file-exists-p org-apple-calendar-source-file)
+       (with-temp-buffer
+         (insert-file-contents org-apple-calendar-source-file)
+         (search-forward key nil t))))
+
+(defun org-apple-calendar--append-adopted-appointment (ev apple-uid)
+  "Append EV as an adopted appointment linked to APPLE-UID."
+  (let ((file org-apple-calendar-source-file)
+        (key (org-apple-calendar--adopt-key ev)))
+    (unless (and file (stringp file))
+      (user-error "Set `org-apple-calendar-source-file' first"))
+    (with-current-buffer (find-file-noselect file)
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (insert (format "* %s\n  %s\n  :PROPERTIES:\n  :ADOPTED_FROM_CALENDAR: %s\n  :ADOPTED_FROM_UID: %s\n  :ADOPTED_FROM_KEY: %s\n  :APPLE_EVENT_ID: %s\n  :APPLE_CALENDAR: %s\n  :END:\n"
+                      (or (plist-get ev :title) "(Termin)")
+                      (org-apple-calendar--event-timestamp ev)
+                      (or (plist-get ev :calendar) "")
+                      (or (plist-get ev :uid) "")
+                      key
+                      apple-uid
+                      org-apple-calendar-target-calendar))
+      (save-buffer))))
+
+(defun org-apple-calendar-adopt-event-at-point ()
+  "Adopt the Apple event at point into `org-apple-calendar-source-file'.
+
+The adopted appointment is created in `org-apple-calendar-target-calendar',
+linked back into `calendar.org' with `APPLE_EVENT_ID', and the original source
+event is marked `ignore' in the local override file so the mirror does not show
+both copies. For recurring source events, the override applies to the source UID
+and therefore hides all occurrences represented by that UID."
+  (interactive)
+  (unless (eq org-apple-calendar-write-backend 'eventkit)
+    (user-error "Adopt requires the EventKit write backend"))
+  (let* ((ev (org-apple-calendar--event-at-point))
+         (source-uid (and ev (plist-get ev :uid)))
+         (key (and ev (org-apple-calendar--adopt-key ev))))
+    (unless ev
+      (user-error "No Apple calendar event at point"))
+    (unless source-uid
+      (user-error "Event at point has no Apple UID"))
+    (when (string= (or (plist-get ev :calendar) "")
+                   org-apple-calendar-target-calendar)
+      (user-error "Event is already in target calendar `%s'"
+                  org-apple-calendar-target-calendar))
+    (when (org-apple-calendar--source-file-contains-key-p key)
+      (user-error "This event occurrence is already adopted"))
+    (when (and (called-interactively-p 'any)
+               (not (y-or-n-p
+                     (format "Adopt '%s' into %s and ignore source? "
+                             (or (plist-get ev :title) "(Termin)")
+                             org-apple-calendar-target-calendar))))
+      (user-error "Adopt cancelled"))
+    (let ((res (org-apple-calendar--eventkit-create-event
+                (plist-get ev :title)
+                (float-time (plist-get ev :start))
+                (float-time (plist-get ev :end))
+                (plist-get ev :all-day)
+                (plist-get ev :notes))))
+      (unless (plist-get res :uid)
+        (user-error "Adopt failed: %s" (or (plist-get res :error) "unknown")))
+      (org-apple-calendar--append-adopted-appointment ev (plist-get res :uid))
+      (org-apple-calendar-set-event-role source-uid 'ignore)
+      (ignore-errors (org-apple-calendar-refresh-mirror))
+      (message "Adopted '%s' into %s and ignored source event"
+               (or (plist-get ev :title) "(Termin)")
+               org-apple-calendar-target-calendar)
+      (plist-get res :uid))))
 
 (defconst org-apple-calendar--delete-script-template
   "ObjC.import('EventKit');
