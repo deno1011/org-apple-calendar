@@ -117,6 +117,19 @@ raises an unrecognized-selector error in JXA). Hour repeaters and weekday/sexp
 patterns are unsupported → keep those native in Apple. Covered by the `ert`
 suite (parsing + script generation; live smoke-tested).
 
+**Two-way sync (done 2026-06-17):** `org-apple-calendar-sync-appointments`
+reconciles the "Org" calendar with `calendar.org` for non-recurring events:
+unlinked timestamped headings are created in Apple; new Apple events are pulled
+in as headings; linked events that differ are reconciled by `modDate` (Apple
+newer ⇒ pull into org, else push to Apple) tracked in `:APPLE_MOD:`; events gone
+from Apple are tagged `:apple-deleted:`/`:APPLE_GONE:` (heading kept); a heading
+with `:APPLE_DELETE: t` is deleted in Apple and removed. Linking relies on a
+stable `eventIdentifier` stored as `:APPLE_EVENT_ID:` in the heading's property
+**drawer (which must precede the timestamp** — otherwise it is not the entry's
+property drawer and the link is unreadable). Recurring events are matched (so
+not duplicated) but otherwise left untouched. Apple-side edits of *recurring*
+series and `DEADLINE`/sexp patterns remain out of scope.
+
 ## Cross-cutting rules (authoritative)
 
 1. Single writer = the "Org" iCloud calendar.
