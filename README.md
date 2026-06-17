@@ -9,11 +9,17 @@ mirrors to Apple on macOS. It is the sibling of
 | `org-apple-reminders` | **dated tasks** (org `SCHEDULED`) | Apple **Reminders** |
 | `org-apple-calendar` (this) | **appointments** + **calendar reading** | Apple **Calendar** (iCloud) |
 
-> Status: **design phase.** This repo currently holds the architecture and the
-> rules. Implementation follows the layered model in
-> [`ARCHITECTURE.md`](ARCHITECTURE.md). The write path (appointments) already
-> runs via `org-caldav` (configured in the `emacs-mac-setup` repo); see
-> *Components* and *Known risks* below.
+> Status: **design phase.** This repo holds the architecture and rules;
+> implementation follows the layered model in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+>
+> **Decision (2026-06-17): all via EventKit/JXA, drop `org-caldav`.** The
+> CalDAV+iCloud+`url.el` path proved fragile (see *Known risks*) and would need
+> a maintained fork + async-reconciled auto-patching. EventKit gives one
+> credential-free stack for both read and write — consistent with
+> `org-apple-reminders`. The interim `org-caldav` config in `emacs-mac-setup`
+> (`modules/55_calendar.org` + `local.org`) is **superseded** and will be
+> retired once the EventKit write path lands. Build order: read layers first
+> (L1/L2), then ingest, then the EventKit write path.
 
 ## Why
 
@@ -60,17 +66,19 @@ task deadlines. This keeps it uncluttered and trustworthy.
 
 ## Components
 
-This system is **two mechanisms**, deliberately:
+One mechanism — **EventKit/JXA**, the same local, credential-free pattern as
+`org-apple-reminders` — for both directions:
 
-1. **Write / bidirectional — appointments.** `calendar.org` ↔ the iCloud "Org"
-   calendar. *Currently:* `org-caldav` (CalDAV). *Configured in* the
-   `emacs-mac-setup` repo (`modules/55_calendar.org` + per-Mac `local.org`),
-   not here. See *Known risks* — CalDAV+iCloud via `url.el` is fragile and may
-   push us toward option (2) for writing too.
-2. **Read + ingest — everything else.** A local **EventKit/JXA** bridge (this
-   package, same pattern as `org-apple-reminders`): read all calendars for
-   availability and read-only agenda display; ingest deadline-like external
-   events into GTD tasks. No credentials, no CalDAV, no write risk.
+1. **Read + ingest — all calendars.** Read every calendar for availability and
+   read-only agenda display; ingest deadline-like external events into GTD tasks.
+2. **Write — appointments.** Create/update events in the dedicated "Org"
+   calendar from `calendar.org`. (EventKit write path; built after the read
+   layers.)
+
+> Retired: `org-caldav` (CalDAV over `url.el`). It was the interim write path;
+> dropped per the decision above. Recurrence, all-day vs timed, and timezones
+> are the real work of the EventKit write path and are called out in
+> `ARCHITECTURE.md`.
 
 ## Relationship to the GTD setup
 

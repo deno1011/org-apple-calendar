@@ -86,11 +86,14 @@ L1  Primitives     JXA/EventKit transport (run script -> JSON); defcustoms
 | Maturity | community tool, but **fragile on iCloud** (see Known risks) | must be built; recurrence/timezones are real work |
 | Consistency w/ reminders | different stack | **same stack** as `org-apple-reminders` |
 
-**Recommendation (to decide):** keep `org-caldav` only if the two iCloud bugs
-(preemptive auth — fixed; `DAV:status ""` parse — open) are cleanly resolved.
-Otherwise build the EventKit write path and retire `org-caldav`, giving one
-credential-free, consistent mechanism for both reminders and calendar. The
-read+ingest layers above are unaffected by this choice.
+**DECIDED (2026-06-17): EventKit write path; `org-caldav` retired.** Keeping
+`org-caldav` would mean maintaining a fork for the `DAV:status ""` bug and
+auto-applying it *after* elpaca's async install — fragile and ongoing toil.
+EventKit removes that entire class of problem (no third-party package, no
+CalDAV, no `url.el`, no credentials) and unifies the stack with
+`org-apple-reminders`. Cost we accept: building event write ourselves
+(recurrence, all-day vs timed, timezones, alarms). The read+ingest layers are
+unaffected and are built first.
 
 ## Cross-cutting rules (authoritative)
 
