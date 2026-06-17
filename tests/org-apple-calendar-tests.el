@@ -83,5 +83,26 @@
                                                '(:freq yearly :interval 3))
     (should (string-match-p "var rfreq=3,rint=3;" script))))
 
+;;; --- two-way sync: change detection ----------------------------------------
+
+(ert-deftest org-apple-calendar-test-appointment-differs ()
+  "`--appointment-differs-p' compares title, time (60s tolerance), and all-day."
+  (let ((appt '(:title "A" :start 1000.0 :end 2000.0 :all-day nil)))
+    (cl-flet ((apple (title s e ad)
+                (list :title title :start (seconds-to-time s)
+                      :end (seconds-to-time e) :all-day ad)))
+      (should-not (org-apple-calendar--appointment-differs-p
+                   appt (apple "A" 1000.0 2000.0 nil)))
+      (should-not (org-apple-calendar--appointment-differs-p
+                   appt (apple "A" 1030.0 2000.0 nil)))  ; 30s < tolerance
+      (should (org-apple-calendar--appointment-differs-p
+               appt (apple "B" 1000.0 2000.0 nil)))      ; title
+      (should (org-apple-calendar--appointment-differs-p
+               appt (apple "A" 1500.0 2000.0 nil)))      ; start moved
+      (should (org-apple-calendar--appointment-differs-p
+               appt (apple "A" 1000.0 5000.0 nil)))      ; end moved
+      (should (org-apple-calendar--appointment-differs-p
+               appt (apple "A" 1000.0 2000.0 t))))))     ; all-day
+
 (provide 'org-apple-calendar-tests)
 ;;; org-apple-calendar-tests.el ends here

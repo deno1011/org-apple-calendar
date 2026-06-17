@@ -132,6 +132,7 @@ if(granted){
               cal:(ev.calendar?ObjC.unwrap(ev.calendar.title):''),
               uid:(ev.eventIdentifier?ObjC.unwrap(ev.eventIdentifier):''),
               avail:ev.availability,
+              mod:(ev.lastModifiedDate?ev.lastModifiedDate.timeIntervalSince1970:0),
               notes:(ev.notes?ObjC.unwrap(ev.notes):''),
               recurring:(ev.hasRecurrenceRules?true:false)});
   }
@@ -156,6 +157,7 @@ Each: :title :start :end (Emacs time) :all-day :calendar :notes :recurring."
                     :calendar (alist-get 'cal ev)
                     :uid (alist-get 'uid ev)
                     :availability (alist-get 'avail ev)
+                    :mod (alist-get 'mod ev)
                     :notes (alist-get 'notes ev)
                     :recurring (eq (alist-get 'recurring ev) t)))
             (alist-get 'events data))))
@@ -596,7 +598,7 @@ if(granted){
     var notes=%s;if(notes){ev.notes=notes;}
     var rfreq=%d,rint=%d;
     if(rfreq>=0){ev.addRecurrenceRule($.EKRecurrenceRule.alloc.initRecurrenceWithFrequencyIntervalEnd(rfreq,rint,$()));}
-    if(store.saveEventSpanError(ev,0,$())){res.ok=true;res.uid=ObjC.unwrap(ev.eventIdentifier);}
+    if(store.saveEventSpanError(ev,0,$())){res.ok=true;res.uid=ObjC.unwrap(ev.eventIdentifier);res.mod=ev.lastModifiedDate.timeIntervalSince1970;}
     else{res.err='save-failed';}
   }
 }
@@ -626,7 +628,7 @@ yearly :interval N) or nil. Return plist with :uid on success or :error."
          (res (alist-get 'result data)))
     (cond
      ((not (eq (alist-get 'granted data) t)) (list :error "no-access"))
-     ((alist-get 'uid res) (list :uid (alist-get 'uid res)))
+     ((alist-get 'uid res) (list :uid (alist-get 'uid res) :mod (alist-get 'mod res)))
      (t (list :error (or (alist-get 'err res) "unknown"))))))
 
 (defun org-apple-calendar--timestamp-recurrence (ts)
@@ -712,14 +714,14 @@ read-only org mirror via heading/timestamp/properties."
     (with-current-buffer (find-file-noselect file)
       (goto-char (point-max))
       (unless (bolp) (insert "\n"))
-      (insert (format "* %s\n  %s\n  :PROPERTIES:\n  :ADOPTED_FROM_CALENDAR: %s\n  :ADOPTED_FROM_UID: %s\n  :ADOPTED_FROM_KEY: %s\n  :APPLE_EVENT_ID: %s\n  :APPLE_CALENDAR: %s\n  :END:\n"
+      (insert (format "* %s\n  :PROPERTIES:\n  :ADOPTED_FROM_CALENDAR: %s\n  :ADOPTED_FROM_UID: %s\n  :ADOPTED_FROM_KEY: %s\n  :APPLE_EVENT_ID: %s\n  :APPLE_CALENDAR: %s\n  :END:\n  %s\n"
                       (or (plist-get ev :title) "(Termin)")
-                      (org-apple-calendar--event-timestamp ev)
                       (or (plist-get ev :calendar) "")
                       (or (plist-get ev :uid) "")
                       key
                       apple-uid
-                      org-apple-calendar-target-calendar))
+                      org-apple-calendar-target-calendar
+                      (org-apple-calendar--event-timestamp ev)))
       (save-buffer))))
 
 (defun org-apple-calendar-adopt-event-at-point ()
@@ -824,12 +826,201 @@ On success the heading is linked (idempotent). Update/delete come later."
                       (org-set-property "APPLE_EVENT_ID" (plist-get res :uid))
                       (org-set-property "APPLE_CALENDAR"
                                         org-apple-calendar-target-calendar)
+                      (when (plist-get res :mod)
+                        (org-set-property "APPLE_MOD"
+                                          (number-to-string (plist-get res :mod))))
                       (cl-incf made))
                   (cl-incf errs))))))
         nil nil))
       (save-buffer))
     (message "Pushed %d appointment(s) to \"%s\", %d error(s)"
              made org-apple-calendar-target-calendar errs)))
+
+;; -- Two-way sync (Apple "Org" calendar <-> calendar.org) -------------------
+
+(defconst org-apple-calendar--update-script-template
+  "ObjC.import('EventKit');
+var store=$.EKEventStore.alloc.init;
+var done=false,granted=false,res={};
+store.requestAccessToEntityTypeCompletion($.EKEntityTypeEvent,function(g){granted=g;done=true;});
+var it=0;while(!done&&it<%d){$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));it++;}
+if(granted){
+  var ev=store.eventWithIdentifier(%s);
+  if(!ev){res.gone=true;}
+  else{
+    ev.title=%s;
+    ev.startDate=$.NSDate.dateWithTimeIntervalSince1970(%f);
+    ev.endDate=$.NSDate.dateWithTimeIntervalSince1970(%f);
+    ev.allDay=%s;
+    if(store.saveEventSpanError(ev,0,$())){res.ok=true;res.mod=ev.lastModifiedDate.timeIntervalSince1970;}
+    else{res.err='save-failed';}
+  }
+}
+JSON.stringify({granted:granted,result:res});"
+  "JXA template: %d iters, %s uid, %s title, %f start, %f end, %s allDay.")
+
+(defun org-apple-calendar--eventkit-update-event (uid title start end all-day)
+  "Update Apple event UID (title/start/end/all-day). START/END epoch seconds.
+Return plist (:ok :mod / :gone / :error)."
+  (let* ((script (format org-apple-calendar--update-script-template
+                         (* 10 org-apple-calendar-access-timeout)
+                         (json-encode uid)
+                         (json-encode (or title "(Termin)"))
+                         (float start) (float end)
+                         (if all-day "true" "false")))
+         (data (org-apple-calendar--jxa-run-json script))
+         (res (alist-get 'result data)))
+    (cond
+     ((not (eq (alist-get 'granted data) t)) (list :error "no-access"))
+     ((eq (alist-get 'ok res) t) (list :ok t :mod (alist-get 'mod res)))
+     ((eq (alist-get 'gone res) t) (list :gone t))
+     (t (list :error (or (alist-get 'err res) "unknown"))))))
+
+(defun org-apple-calendar--appointment-differs-p (appt apple)
+  "Non-nil when org APPT differs from Apple event APPLE (title/time/all-day).
+APPT :start/:end are epoch floats; APPLE :start/:end are Emacs time."
+  (or (not (string= (or (plist-get appt :title) "")
+                    (or (plist-get apple :title) "")))
+      (not (eq (and (plist-get appt :all-day) t)
+               (and (plist-get apple :all-day) t)))
+      (>= (abs (- (plist-get appt :start)
+                  (float-time (plist-get apple :start)))) 60)
+      (>= (abs (- (plist-get appt :end)
+                  (float-time (plist-get apple :end)))) 60)))
+
+(defun org-apple-calendar--set-entry-timestamp (tsstr)
+  "Replace the first active timestamp in the entry at point with TSSTR."
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((end (save-excursion (org-end-of-subtree t t))))
+      (if (re-search-forward org-ts-regexp end t)
+          (replace-match tsstr t t)
+        (end-of-line)
+        (insert "\n  " tsstr)))))
+
+(defun org-apple-calendar--pull-into-entry (apple)
+  "Update the org heading at point from Apple event APPLE (title/timestamp/mod)."
+  (org-edit-headline (or (plist-get apple :title) "(Termin)"))
+  (org-apple-calendar--set-entry-timestamp
+   (org-apple-calendar--event-timestamp apple))
+  (org-set-property "APPLE_MOD"
+                    (number-to-string (or (plist-get apple :mod) 0))))
+
+(defun org-apple-calendar--append-pulled-appointment (apple)
+  "Append Apple event APPLE as a new linked heading to the source file."
+  (with-current-buffer (find-file-noselect org-apple-calendar-source-file)
+    (goto-char (point-max))
+    (unless (bolp) (insert "\n"))
+    (insert (format "* %s\n  :PROPERTIES:\n  :APPLE_EVENT_ID: %s\n  :APPLE_CALENDAR: %s\n  :APPLE_MOD: %s\n  :END:\n  %s\n"
+                    (or (plist-get apple :title) "(Termin)")
+                    (or (plist-get apple :uid) "")
+                    org-apple-calendar-target-calendar
+                    (number-to-string (or (plist-get apple :mod) 0))
+                    (org-apple-calendar--event-timestamp apple)))))
+
+(defun org-apple-calendar-sync-appointments ()
+  "Two-way sync between `calendar.org' and the \"Org\" Apple calendar.
+
+Non-recurring appointments. Per heading: unlinked + timestamp -> create; linked
++ `:APPLE_DELETE: t' -> delete in Apple + remove heading; linked but gone in
+Apple -> tag `:apple-deleted:' + `:APPLE_GONE:' (heading kept); linked & differ
+-> Apple newer (by modDate) pulls into org, else org pushes to Apple. Finally,
+Apple events with no heading are pulled in. Recurring events are matched but
+left untouched."
+  (interactive)
+  (unless (eq org-apple-calendar-write-backend 'eventkit)
+    (user-error "Sync requires the EventKit write backend"))
+  (let ((file org-apple-calendar-source-file))
+    (unless (and file (file-exists-p file))
+      (user-error "Set `org-apple-calendar-source-file' (e.g. calendar.org)"))
+    (let ((start (time-subtract (current-time) (days-to-time 30)))
+          (end (time-add (current-time) (days-to-time 365)))
+          (by-uid (make-hash-table :test 'equal))
+          (matched (make-hash-table :test 'equal))
+          (to-delete '())
+          (created 0) (pushed 0) (pulled 0) (deleted 0) (gone 0) (pulled-new 0))
+      (dolist (ev (org-apple-calendar-fetch-events start end))
+        (when (and (string= (plist-get ev :calendar)
+                            org-apple-calendar-target-calendar)
+                   (not (gethash (plist-get ev :uid) by-uid)))
+          (puthash (plist-get ev :uid) ev by-uid)))
+      (with-current-buffer (find-file-noselect file)
+        (org-with-wide-buffer
+         (org-map-entries
+          (lambda ()
+            (let* ((uid (org-entry-get nil "APPLE_EVENT_ID"))
+                   (del (org-entry-get nil "APPLE_DELETE"))
+                   (appt (org-apple-calendar--entry-appointment)))
+              (cond
+               ((and uid del)
+                (puthash uid t matched)   ; don't re-pull the event we're deleting
+                (push (cons (point-marker) uid) to-delete))
+               ((and (not uid) appt (not (org-entry-get nil "APPLE_GONE")))
+                (let ((res (org-apple-calendar--eventkit-create-event
+                            (plist-get appt :title) (plist-get appt :start)
+                            (plist-get appt :end) (plist-get appt :all-day)
+                            (plist-get appt :notes) (plist-get appt :recurrence))))
+                  (when (plist-get res :uid)
+                    (org-set-property "APPLE_EVENT_ID" (plist-get res :uid))
+                    (org-set-property "APPLE_CALENDAR"
+                                      org-apple-calendar-target-calendar)
+                    (when (plist-get res :mod)
+                      (org-set-property "APPLE_MOD"
+                                        (number-to-string (plist-get res :mod))))
+                    (puthash (plist-get res :uid) t matched)
+                    (cl-incf created))))
+               (uid
+                (puthash uid t matched)
+                (let ((apple (gethash uid by-uid)))
+                  (cond
+                   ((null apple)
+                    (unless (org-entry-get nil "APPLE_GONE")
+                      (org-toggle-tag "apple-deleted" 'on)
+                      (org-set-property "APPLE_GONE" "t")
+                      (cl-incf gone)))
+                   ((or (plist-get apple :recurring)
+                        (and appt (plist-get appt :recurrence)))
+                    nil)
+                   ((and appt (org-apple-calendar--appointment-differs-p appt apple))
+                    (let* ((stored (string-to-number
+                                    (or (org-entry-get nil "APPLE_MOD") "0")))
+                           (amod (or (plist-get apple :mod) 0)))
+                      (if (> amod (+ stored 2))
+                          (progn (org-apple-calendar--pull-into-entry apple)
+                                 (cl-incf pulled))
+                        (let ((res (org-apple-calendar--eventkit-update-event
+                                    uid (plist-get appt :title)
+                                    (plist-get appt :start) (plist-get appt :end)
+                                    (plist-get appt :all-day))))
+                          (when (plist-get res :mod)
+                            (org-set-property
+                             "APPLE_MOD" (number-to-string (plist-get res :mod))))
+                          (cl-incf pushed)))))
+                   (t (unless (org-entry-get nil "APPLE_MOD")
+                        (org-set-property
+                         "APPLE_MOD"
+                         (number-to-string (or (plist-get apple :mod) 0)))))))))))
+          nil nil)
+         ;; deferred deletes (after the walk, latest-first)
+         (dolist (md (sort to-delete (lambda (a b) (> (marker-position (car a))
+                                                      (marker-position (car b))))))
+           (org-apple-calendar--eventkit-delete-event (cdr md))
+           (goto-char (car md))
+           (org-back-to-heading t)
+           (delete-region (point) (save-excursion (org-end-of-subtree t t)))
+           (cl-incf deleted))
+         (save-buffer)))
+      ;; pull new Apple events (non-recurring, unmatched)
+      (maphash
+       (lambda (uid apple)
+         (when (and (not (gethash uid matched))
+                    (not (plist-get apple :recurring)))
+           (org-apple-calendar--append-pulled-appointment apple)
+           (cl-incf pulled-new)))
+       by-uid)
+      (with-current-buffer (find-file-noselect file) (save-buffer))
+      (message "Sync: %d created · %d→Apple · %d←Apple · %d new · %d deleted · %d gone"
+               created pushed pulled pulled-new deleted gone))))
 
 (provide 'org-apple-calendar)
 ;;; org-apple-calendar.el ends here
