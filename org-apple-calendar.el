@@ -1,0 +1,111 @@
+;;; org-apple-calendar.el --- Read Apple Calendar (EventKit) into org -*- lexical-binding: t; -*-
+;;
+;; Author: Denis Butic
+;; Version: 0.1.0
+;; Keywords: calendar, outlines
+;; Package-Requires: ((emacs "29.1"))
+;;
+;; Read-only EventKit bridge (L1–L2): list calendars with owned/managed
+;; classification; fetch events (later). The write path and ingest come later.
+;; macOS only.
+;;
+;; Public API:
+;;   (org-apple-calendar-list-calendars)   -> list of plists
+;;   (org-apple-calendar-show-calendars)   -> interactive, tabulated view
+;;
+;;; Code:
+
+(require 'json)
+
+(defgroup org-apple-calendar nil
+  "Read Apple Calendar (EventKit) into org."
+  :group 'org)
+
+(defcustom org-apple-calendar-access-timeout 25
+  "Seconds to wait for the macOS Calendar-access grant / EventKit reply."
+  :type 'integer :group 'org-apple-calendar)
+
+(defun org-apple-calendar--jxa-run (script)
+  "Run JXA SCRIPT via osascript and return its stdout as a string."
+  (with-output-to-string
+    (with-current-buffer standard-output
+      (call-process "osascript" nil t nil "-l" "JavaScript" "-e" script))))
+
+(defun org-apple-calendar--jxa-run-json (script)
+  "Run JXA SCRIPT and parse its JSON stdout (objects->alist, arrays->list)."
+  (let ((raw (string-trim (org-apple-calendar--jxa-run script))))
+    (when (string-empty-p raw)
+      (user-error "Calendar: empty reply (Calendar access denied or timed out)"))
+    (condition-case nil
+        (json-parse-string raw :object-type 'alist :array-type 'list
+                           :false-object nil :null-object nil)
+      (error (user-error "Calendar: could not parse reply: %s" raw)))))
+
+(defconst org-apple-calendar--list-script-template
+  "ObjC.import('EventKit');
+var store=$.EKEventStore.alloc.init;
+var done=false,granted=false,out=[];
+store.requestAccessToEntityTypeCompletion($.EKEntityTypeEvent,function(g){granted=g;done=true;});
+var iter=0,max=%d;
+while(!done&&iter<max){$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));iter++;}
+if(granted){
+  var cals=store.calendarsForEntityType($.EKEntityTypeEvent);
+  for(var i=0;i<cals.count;i++){
+    var c=cals.objectAtIndex(i);
+    out.push({title:ObjC.unwrap(c.title),
+              id:ObjC.unwrap(c.calendarIdentifier),
+              writable:c.allowsContentModifications,
+              type:c.type,
+              source:(c.source?ObjC.unwrap(c.source.title):'')});
+  }
+}
+JSON.stringify({granted:granted,calendars:out});"
+  "JXA template; one %d placeholder = run-loop iterations (timeout*10).")
+
+(defun org-apple-calendar--type-label (n)
+  "Human label for EKCalendarType integer N."
+  (pcase n (0 "Local") (1 "CalDAV") (2 "Exchange")
+         (3 "Subscription") (4 "Birthday") (_ (format "Type%s" n))))
+
+(defun org-apple-calendar-list-calendars ()
+  "Return Apple event calendars as a list of plists.
+Each plist: :title :id :writable (t = owned/managed-by-you) :type :source.
+Signals a `user-error' if Calendar access is not granted."
+  (let* ((script (format org-apple-calendar--list-script-template
+                         (* 10 org-apple-calendar-access-timeout)))
+         (data (org-apple-calendar--jxa-run-json script)))
+    (unless (eq (alist-get 'granted data) t)
+      (user-error "Calendar access not granted (approve the macOS prompt for Emacs)"))
+    (mapcar (lambda (c)
+              (list :title (alist-get 'title c)
+                    :id (alist-get 'id c)
+                    :writable (eq (alist-get 'writable c) t)
+                    :type (org-apple-calendar--type-label (alist-get 'type c))
+                    :source (alist-get 'source c)))
+            (alist-get 'calendars data))))
+
+(defun org-apple-calendar-show-calendars ()
+  "Display all Apple calendars classified as owned (writable) vs read-only."
+  (interactive)
+  (let ((cals (org-apple-calendar-list-calendars))
+        (buf (get-buffer-create "*Apple Calendars*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "Apple Calendars — owned (writable) vs read-only (managed/subscribed)\n")
+        (insert (make-string 72 ?-) "\n")
+        (dolist (c (sort cals (lambda (a b)
+                                (and (plist-get a :writable)
+                                     (not (plist-get b :writable))))))
+          (insert (format "%-4s %-12s %-28s %s\n"
+                          (if (plist-get c :writable) "RW" "ro")
+                          (plist-get c :type)
+                          (truncate-string-to-width (or (plist-get c :title) "") 28)
+                          (or (plist-get c :source) ""))))
+        (goto-char (point-min))
+        (view-mode 1)))
+    (display-buffer buf)
+    cals))
+
+(provide 'org-apple-calendar)
+;;; org-apple-calendar.el ends here
