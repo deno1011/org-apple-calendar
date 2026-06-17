@@ -486,6 +486,148 @@ re-running never duplicates. The source calendar is never modified."
                (file-name-nondirectory (or org-apple-calendar-ingest-file "?"))))))
 #+end_src
 
+* L2/L5 — Write backend (appointments → "Org" calendar)
+
+Push appointments from a source org file (active timestamps) into the dedicated
+"Org" calendar via EventKit. Reinstall-safe: the target is resolved by *name*
+(`org-apple-calendar-target-calendar'), never a hard-coded identifier.
+Idempotent via `:APPLE_EVENT_ID:'; v1 creates new events (update/delete/pull
+are later increments). The CalDAV backend delegates to `org-caldav`.
+
+#+begin_src emacs-lisp :tangle yes
+(require 'org-element)
+
+(defcustom org-apple-calendar-write-backend 'eventkit
+  "Backend for writing appointments to Apple Calendar."
+  :type '(choice (const eventkit) (const caldav)) :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-target-calendar "Org"
+  "Name of the single Apple calendar this package writes to."
+  :type 'string :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-source-file nil
+  "Org file whose active-timestamp headings are pushed as appointments."
+  :type '(choice (const nil) file) :group 'org-apple-calendar)
+
+(defconst org-apple-calendar--create-script-template
+  "ObjC.import('EventKit');
+var store=$.EKEventStore.alloc.init;
+var done=false,granted=false,res={};
+store.requestAccessToEntityTypeCompletion($.EKEntityTypeEvent,function(g){granted=g;done=true;});
+var it=0;while(!done&&it<%d){$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));it++;}
+if(granted){
+  var cals=store.calendarsForEntityType($.EKEntityTypeEvent),cal=null,tgt=%s;
+  for(var i=0;i<cals.count;i++){var c=cals.objectAtIndex(i);if(ObjC.unwrap(c.title)===tgt){cal=c;break;}}
+  if(!cal){res.err='calendar-not-found';}
+  else{
+    var ev=$.EKEvent.eventWithEventStore(store);
+    ev.title=%s;ev.calendar=cal;
+    ev.startDate=$.NSDate.dateWithTimeIntervalSince1970(%f);
+    ev.endDate=$.NSDate.dateWithTimeIntervalSince1970(%f);
+    ev.allDay=%s;
+    var notes=%s;if(notes){ev.notes=notes;}
+    if(store.saveEventSpanError(ev,0,$())){res.ok=true;res.uid=ObjC.unwrap(ev.eventIdentifier);}
+    else{res.err='save-failed';}
+  }
+}
+JSON.stringify({granted:granted,result:res});"
+  "JXA template: %d iters, then %s target, %s title, %f start, %f end, %s allDay, %s notes.")
+
+(defun org-apple-calendar--eventkit-create-event (title start end all-day notes)
+  "Create an event in `org-apple-calendar-target-calendar' via EventKit.
+START/END are epoch seconds. Return plist with :uid on success or :error."
+  (let* ((script (format org-apple-calendar--create-script-template
+                         (* 10 org-apple-calendar-access-timeout)
+                         (json-encode org-apple-calendar-target-calendar)
+                         (json-encode (or title "(Termin)"))
+                         (float start) (float end)
+                         (if all-day "true" "false")
+                         (if (and notes (not (string-empty-p notes)))
+                             (json-encode notes) "null")))
+         (data (org-apple-calendar--jxa-run-json script))
+         (res (alist-get 'result data)))
+    (cond
+     ((not (eq (alist-get 'granted data) t)) (list :error "no-access"))
+     ((alist-get 'uid res) (list :uid (alist-get 'uid res)))
+     (t (list :error (or (alist-get 'err res) "unknown"))))))
+
+(defun org-apple-calendar--entry-appointment ()
+  "Return a plist for the appointment at point, or nil when it has no timestamp.
+Plist: :title :start :end (epoch) :all-day :notes."
+  (let ((tsstr (org-entry-get nil "TIMESTAMP")))
+    (when tsstr
+      (let* ((ts (org-timestamp-from-string tsstr))
+             (all-day (not (org-element-property :hour-start ts)))
+             (start (float-time (org-timestamp-to-time ts)))
+             (end (float-time (org-timestamp-to-time ts t))))
+        (when (and (not all-day) (<= end start)) (setq end (+ start 3600)))
+        (list :title (org-get-heading t t t t)
+              :start start :end end :all-day all-day :notes nil)))))
+
+(defconst org-apple-calendar--delete-script-template
+  "ObjC.import('EventKit');
+var store=$.EKEventStore.alloc.init;
+var done=false,granted=false,res={};
+store.requestAccessToEntityTypeCompletion($.EKEntityTypeEvent,function(g){granted=g;done=true;});
+var it=0;while(!done&&it<%d){$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));it++;}
+if(granted){
+  var ev=store.eventWithIdentifier(%s);
+  if(!ev){res.gone=true;}
+  else if(store.removeEventSpanError(ev,0,$())){res.ok=true;}
+  else{res.err='remove-failed';}
+}
+JSON.stringify({granted:granted,result:res});"
+  "JXA template: %d iters, %s event identifier (json-encoded).")
+
+(defun org-apple-calendar--eventkit-delete-event (uid)
+  "Delete the event with identifier UID from Apple Calendar.
+Return plist (:ok / :gone / :error)."
+  (let* ((script (format org-apple-calendar--delete-script-template
+                         (* 10 org-apple-calendar-access-timeout)
+                         (json-encode uid)))
+         (data (org-apple-calendar--jxa-run-json script))
+         (res (alist-get 'result data)))
+    (cond
+     ((not (eq (alist-get 'granted data) t)) (list :error "no-access"))
+     ((eq (alist-get 'ok res) t) (list :ok t))
+     ((eq (alist-get 'gone res) t) (list :gone t))
+     (t (list :error (or (alist-get 'err res) "unknown"))))))
+
+(defun org-apple-calendar-push-appointments ()
+  "Push new appointments from `org-apple-calendar-source-file' to the Org calendar.
+A heading is pushed when it has an active timestamp and no `:APPLE_EVENT_ID:'.
+On success the heading is linked (idempotent). Update/delete come later."
+  (interactive)
+  (unless (eq org-apple-calendar-write-backend 'eventkit)
+    (user-error "Write backend is `caldav' — use `org-caldav-sync' instead"))
+  (let ((file org-apple-calendar-source-file) (made 0) (errs 0))
+    (unless (and file (file-exists-p file))
+      (user-error "Set `org-apple-calendar-source-file' (e.g. calendar.org)"))
+    (with-current-buffer (find-file-noselect file)
+      (org-with-wide-buffer
+       (goto-char (point-min))
+       (org-map-entries
+        (lambda ()
+          (let ((appt (and (not (org-entry-get nil "APPLE_EVENT_ID"))
+                           (org-apple-calendar--entry-appointment))))
+            (when appt
+              (let ((res (org-apple-calendar--eventkit-create-event
+                          (plist-get appt :title) (plist-get appt :start)
+                          (plist-get appt :end) (plist-get appt :all-day)
+                          (plist-get appt :notes))))
+                (if (plist-get res :uid)
+                    (progn
+                      (org-set-property "APPLE_EVENT_ID" (plist-get res :uid))
+                      (org-set-property "APPLE_CALENDAR"
+                                        org-apple-calendar-target-calendar)
+                      (cl-incf made))
+                  (cl-incf errs))))))
+        nil nil))
+      (save-buffer))
+    (message "Pushed %d appointment(s) to \"%s\", %d error(s)"
+             made org-apple-calendar-target-calendar errs)))
+#+end_src
+
 * Module footer
 
 #+begin_src emacs-lisp :tangle yes
