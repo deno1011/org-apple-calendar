@@ -136,6 +136,103 @@ Signals a `user-error' if Calendar access is not granted."
     cals))
 #+end_src
 
+* L2 — Events & free/busy
+
+=--fetch-events= queries EventKit for all events in a time window (all
+calendars), returning epoch seconds we convert to Emacs time in L3-ish helpers.
+=free-busy= merges timed events into busy intervals — the basis for
+"when am I free".
+
+#+begin_src emacs-lisp :tangle yes
+(defconst org-apple-calendar--events-script-template
+  "ObjC.import('EventKit');
+var store=$.EKEventStore.alloc.init;
+var done=false,granted=false,out=[];
+store.requestAccessToEntityTypeCompletion($.EKEntityTypeEvent,function(g){granted=g;done=true;});
+var it=0,mx=%d;
+while(!done&&it<mx){$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));it++;}
+if(granted){
+  var s=$.NSDate.dateWithTimeIntervalSince1970(%f);
+  var e=$.NSDate.dateWithTimeIntervalSince1970(%f);
+  var pred=store.predicateForEventsWithStartDateEndDateCalendars(s,e,$());
+  var evs=store.eventsMatchingPredicate(pred);
+  for(var i=0;i<evs.count;i++){
+    var ev=evs.objectAtIndex(i);
+    out.push({title:(ev.title?ObjC.unwrap(ev.title):''),
+              start:ev.startDate.timeIntervalSince1970,
+              end:ev.endDate.timeIntervalSince1970,
+              allDay:ev.allDay,
+              cal:(ev.calendar?ObjC.unwrap(ev.calendar.title):''),
+              notes:(ev.notes?ObjC.unwrap(ev.notes):''),
+              recurring:(ev.hasRecurrenceRules?true:false)});
+  }
+}
+JSON.stringify({granted:granted,events:out});"
+  "JXA template: one %d (run-loop iters), two %f (start/end unix seconds).")
+
+(defun org-apple-calendar-fetch-events (start end)
+  "Return events between START and END (Emacs time values) as plists.
+Each: :title :start :end (Emacs time) :all-day :calendar :notes :recurring."
+  (let* ((script (format org-apple-calendar--events-script-template
+                         (* 10 org-apple-calendar-access-timeout)
+                         (float-time start) (float-time end)))
+         (data (org-apple-calendar--jxa-run-json script)))
+    (unless (eq (alist-get 'granted data) t)
+      (user-error "Calendar access not granted (approve the macOS prompt for Emacs)"))
+    (mapcar (lambda (ev)
+              (list :title (alist-get 'title ev)
+                    :start (seconds-to-time (alist-get 'start ev))
+                    :end (seconds-to-time (alist-get 'end ev))
+                    :all-day (eq (alist-get 'allDay ev) t)
+                    :calendar (alist-get 'cal ev)
+                    :notes (alist-get 'notes ev)
+                    :recurring (eq (alist-get 'recurring ev) t)))
+            (alist-get 'events data))))
+
+(defun org-apple-calendar-free-busy (start end)
+  "Return merged busy intervals (list of (BEG . END) Emacs-time pairs) in [START,END).
+Timed events count as busy; all-day events are ignored."
+  (let ((ivs (sort (delq nil (mapcar (lambda (ev)
+                                       (unless (plist-get ev :all-day)
+                                         (cons (plist-get ev :start) (plist-get ev :end))))
+                                     (org-apple-calendar-fetch-events start end)))
+                   (lambda (a b) (time-less-p (car a) (car b)))))
+        (merged '()))
+    (dolist (iv ivs)
+      (let ((last (car merged)))
+        (if (and last (not (time-less-p (cdr last) (car iv))))
+            (when (time-less-p (cdr last) (cdr iv))
+              (setcdr last (cdr iv)))
+          (push iv merged))))
+    (nreverse merged)))
+
+(defun org-apple-calendar-upcoming (&optional days)
+  "Display events for the next DAYS (default 14) across all calendars."
+  (interactive "P")
+  (let* ((days (if days (prefix-numeric-value days) 14))
+         (start (current-time))
+         (end (time-add start (days-to-time days)))
+         (evs (sort (org-apple-calendar-fetch-events start end)
+                    (lambda (a b) (time-less-p (plist-get a :start)
+                                               (plist-get b :start)))))
+         (buf (get-buffer-create "*Apple Calendar — Upcoming*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Upcoming — next %d days (%d events)\n" days (length evs)))
+        (insert (make-string 72 ?-) "\n")
+        (dolist (ev evs)
+          (insert (format "%s  %-20s %s%s\n"
+                          (format-time-string
+                           (if (plist-get ev :all-day) "%a %d.%m.      " "%a %d.%m. %H:%M")
+                           (plist-get ev :start))
+                          (truncate-string-to-width (or (plist-get ev :calendar) "") 20)
+                          (or (plist-get ev :title) "")
+                          (if (plist-get ev :recurring) " ↻" ""))))
+        (goto-char (point-min)) (view-mode 1)))
+    (display-buffer buf)))
+#+end_src
+
 * Module footer
 
 #+begin_src emacs-lisp :tangle yes
