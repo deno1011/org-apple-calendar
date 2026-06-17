@@ -61,6 +61,13 @@ task deadlines. This keeps it uncluttered and trustworthy.
    **and hide them in Calendar.app's sidebar**. Same effect, robust, reversible.
 5. **Availability** ("when am I free") is computed by reading **all** calendars
    (busy intervals), not just "Org".
+6. **Events have a role, not just a time:** `busy` (blocks my time), `info`
+   (time-bound context — a colleague's slot, a custody week, school — shown but
+   never blocking), or `ignore`. Role = per-event **override** (set in the GTD
+   view, persisted) > per-calendar policy > Apple "Show As" availability >
+   default busy. Only `busy` events reduce free slots. See `ARCHITECTURE.md`
+   → *Event classification & roles*. The override exists because read-only
+   third-party calendars can't be fixed at the source.
 6. **Date convention** (shipped in `org-apple-reminders` v1.16): org `SCHEDULED`
    ⇄ Apple due date. Apple shows an item on its due day (like `SCHEDULED`), not
    ahead of time (like `DEADLINE`). `DEADLINE` is not synced.

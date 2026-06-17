@@ -164,6 +164,7 @@ if(granted){
               allDay:ev.allDay,
               cal:(ev.calendar?ObjC.unwrap(ev.calendar.title):''),
               uid:(ev.eventIdentifier?ObjC.unwrap(ev.eventIdentifier):''),
+              avail:ev.availability,
               notes:(ev.notes?ObjC.unwrap(ev.notes):''),
               recurring:(ev.hasRecurrenceRules?true:false)});
   }
@@ -187,6 +188,7 @@ Each: :title :start :end (Emacs time) :all-day :calendar :notes :recurring."
                     :all-day (eq (alist-get 'allDay ev) t)
                     :calendar (alist-get 'cal ev)
                     :uid (alist-get 'uid ev)
+                    :availability (alist-get 'avail ev)
                     :notes (alist-get 'notes ev)
                     :recurring (eq (alist-get 'recurring ev) t)))
             (alist-get 'events data))))
@@ -195,7 +197,8 @@ Each: :title :start :end (Emacs time) :all-day :calendar :notes :recurring."
   "Return merged busy intervals (list of (BEG . END) Emacs-time pairs) in [START,END).
 Timed events count as busy; all-day events are ignored."
   (let ((ivs (sort (delq nil (mapcar (lambda (ev)
-                                       (unless (plist-get ev :all-day)
+                                       (when (and (not (plist-get ev :all-day))
+                                                  (eq (org-apple-calendar--event-role ev) 'busy))
                                          (cons (plist-get ev :start) (plist-get ev :end))))
                                      (org-apple-calendar-fetch-events start end)))
                    (lambda (a b) (time-less-p (car a) (car b)))))
@@ -224,15 +227,108 @@ Timed events count as busy; all-day events are ignored."
         (insert (format "Upcoming — next %d days (%d events)\n" days (length evs)))
         (insert (make-string 72 ?-) "\n")
         (dolist (ev evs)
-          (insert (format "%s  %-20s %s%s\n"
-                          (format-time-string
-                           (if (plist-get ev :all-day) "%a %d.%m.      " "%a %d.%m. %H:%M")
-                           (plist-get ev :start))
-                          (truncate-string-to-width (or (plist-get ev :calendar) "") 20)
-                          (or (plist-get ev :title) "")
-                          (if (plist-get ev :recurring) " ↻" ""))))
+          (let ((role (org-apple-calendar--event-role ev)))
+            (unless (eq role 'ignore)
+              (insert (propertize
+                       (format "%s %s  %-20s %s%s\n"
+                               (pcase role ('busy "●") ('info "○") (_ "·"))
+                               (format-time-string
+                                (if (plist-get ev :all-day) "%a %d.%m.      " "%a %d.%m. %H:%M")
+                                (plist-get ev :start))
+                               (truncate-string-to-width (or (plist-get ev :calendar) "") 20)
+                               (or (plist-get ev :title) "")
+                               (if (plist-get ev :recurring) " ↻" ""))
+                       'apple-uid (plist-get ev :uid))))))
         (goto-char (point-min)) (view-mode 1)))
     (display-buffer buf)))
+#+end_src
+
+* L3 — Event roles & overrides
+
+Not every calendar entry blocks *my* time. Each event has a role:
+- =busy= — consumes my time → removed from free slots;
+- =info= — time-bound context (a colleague's training, custody week, school) →
+  visible, but does NOT block;
+- =ignore= — not shown at all (e.g. week numbers).
+
+Role is decided by: a per-event **override** (highest, kept on the Emacs side
+since source calendars are read-only) → per-calendar policy (=ignore=/=info=
+lists) → the event's Apple **availability** (Free ⇒ info) → default =busy=.
+The override is the safety net when Apple's classification is wrong.
+
+#+begin_src emacs-lisp :tangle yes
+(defcustom org-apple-calendar-info-calendars nil
+  "Calendar titles whose events are context/info — never block free time."
+  :type '(repeat string) :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-ignore-calendars nil
+  "Calendar titles whose events are hidden entirely (e.g. week numbers)."
+  :type '(repeat string) :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-overrides-file
+  (expand-file-name "org-apple-calendar/overrides.eld" user-emacs-directory)
+  "File persisting per-event role overrides as an alist (UID . ROLE)."
+  :type 'file :group 'org-apple-calendar)
+
+(defvar org-apple-calendar--overrides 'unset
+  "Cached overrides alist (UID . ROLE); `unset' until first load.")
+
+(defun org-apple-calendar--load-overrides ()
+  "Load and cache the per-event role overrides."
+  (when (eq org-apple-calendar--overrides 'unset)
+    (setq org-apple-calendar--overrides
+          (when (file-exists-p org-apple-calendar-overrides-file)
+            (with-temp-buffer
+              (insert-file-contents org-apple-calendar-overrides-file)
+              (ignore-errors (read (current-buffer)))))))
+  org-apple-calendar--overrides)
+
+(defun org-apple-calendar--save-overrides ()
+  "Persist the overrides alist."
+  (make-directory (file-name-directory org-apple-calendar-overrides-file) t)
+  (with-temp-file org-apple-calendar-overrides-file
+    (prin1 org-apple-calendar--overrides (current-buffer))))
+
+(defun org-apple-calendar-set-event-role (uid role)
+  "Persist ROLE (`busy'/`info'/`ignore', or nil to clear) as override for UID."
+  (org-apple-calendar--load-overrides)
+  (setq org-apple-calendar--overrides
+        (assoc-delete-all uid org-apple-calendar--overrides))
+  (when role (push (cons uid role) org-apple-calendar--overrides))
+  (org-apple-calendar--save-overrides)
+  role)
+
+(defun org-apple-calendar--event-role (ev)
+  "Effective role of EV: `busy', `info', or `ignore'.
+Priority: per-event override > ignore/info calendar policy > Apple
+availability (Free ⇒ info) > default busy."
+  (let ((ovr (cdr (assoc (plist-get ev :uid) (org-apple-calendar--load-overrides))))
+        (cal (plist-get ev :calendar)))
+    (cond
+     (ovr ovr)
+     ((member cal org-apple-calendar-ignore-calendars) 'ignore)
+     ((member cal org-apple-calendar-info-calendars) 'info)
+     ((eql (plist-get ev :availability) 1) 'info)   ; EKEventAvailabilityFree
+     (t 'busy))))
+
+(defun org-apple-calendar--uid-at-point ()
+  "Apple event UID at point: from the `apple-uid' text prop or org property."
+  (or (get-text-property (point) 'apple-uid)
+      (and (derived-mode-p 'org-mode) (org-entry-get nil "APPLE_EVENT_UID"))))
+
+(defun org-apple-calendar-override-role (role)
+  "Override the busy/info/ignore ROLE for the calendar event at point.
+Works in the upcoming/free buffers (text prop) and the agenda mirror (org
+property). Choosing \"clear\" removes the override."
+  (interactive
+   (list (let ((r (completing-read "Rolle (busy/info/ignore/clear): "
+                                   '("busy" "info" "ignore" "clear") nil t)))
+           (unless (string= r "clear") (intern r)))))
+  (let ((uid (org-apple-calendar--uid-at-point)))
+    (unless uid (user-error "Kein Apple-Event an dieser Stelle"))
+    (org-apple-calendar-set-event-role uid role)
+    (message "Rolle gesetzt: %s — View neu laden (C-c k u / m) zum Aktualisieren"
+             (or role "default"))))
 #+end_src
 
 * L3 — Availability (free slots)
@@ -361,10 +457,14 @@ backend.
               "# AUTO-GENERATED by org-apple-calendar — do not edit (overwritten on refresh).\n"
               "# Visibility only. Create appointments in calendar.org, not here.\n\n")
       (dolist (ev evs)
-        (insert (format "* %s\n  %s\n  :PROPERTIES:\n  :CALENDAR: %s\n  :END:\n"
-                        (or (plist-get ev :title) "(ohne Titel)")
-                        (org-apple-calendar--event-timestamp ev)
-                        (or (plist-get ev :calendar) "")))))
+        (let ((role (org-apple-calendar--event-role ev)))
+          (unless (eq role 'ignore)
+            (insert (format "* %s%s\n  %s\n  :PROPERTIES:\n  :CALENDAR: %s\n  :APPLE_EVENT_UID: %s\n  :END:\n"
+                            (or (plist-get ev :title) "(ohne Titel)")
+                            (if (eq role 'info) " :info:" "")
+                            (org-apple-calendar--event-timestamp ev)
+                            (or (plist-get ev :calendar) "")
+                            (or (plist-get ev :uid) "")))))))
     (add-to-list 'org-agenda-files file)
     (when (called-interactively-p 'any)
       (message "Calendar mirror: %d events → %s" (length evs) file))

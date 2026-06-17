@@ -119,6 +119,43 @@ implementation differ between backends.
 6. `SCHEDULED` ⇄ Apple due date; appointments = active timestamps; `DEADLINE`
    not synced.
 
+## Event classification & roles (how calendar entries are handled)
+
+The key insight: **a calendar entry is not automatically "I am busy".** Many
+entries are time-bound *context* that informs planning without consuming the
+user's time — a colleague's training slot ("Training Vladimir"), a custody week
+("Kinder bei mir"), the kids' school calendar, week numbers. Treating all events
+as busy makes free-slots wrong (it once blocked 20:00 for a colleague's class).
+
+So every event has a **role**:
+
+| Role | Meaning | Effect |
+|---|---|---|
+| `busy` | consumes my time | removed from free slots |
+| `info` | time-bound context (colleague, custody, school) | shown in agenda/mirror, does **not** block |
+| `ignore` | noise (e.g. week numbers) | not shown at all |
+
+**Role is decided by priority** (`org-apple-calendar--event-role`):
+1. **per-event override** — highest. Kept on the Emacs side (an `(uid . role)`
+   alist persisted to `org-apple-calendar-overrides-file`), because the source
+   calendars are read-only and Apple's data is often misclassified. Set via
+   `org-apple-calendar-override-role` (`C-c k o`) on the event at point in the
+   upcoming/mirror views. **This is the safety net.**
+2. **per-calendar policy** — `org-apple-calendar-ignore-calendars` /
+   `-info-calendars` (classify a whole calendar once: colleagues' schedule,
+   family/custody, school → info; week numbers → ignore).
+3. **Apple availability** — `EKEvent.availability`; "Show As: Free" ⇒ info.
+4. **default** — `busy`.
+
+Only `busy` (and non-all-day) events feed `free-busy`/`free-slots`. All-day
+entries are context by nature and never block. `info` events still appear in
+the agenda mirror (tagged `:info:`); `ignore` events are dropped.
+
+Rationale for the override being authoritative: with read-only third-party
+calendars you cannot fix classification at the source, and maintaining correct
+"Show As" on every event by hand is unrealistic — so the GTD side must be able
+to overrule, cheaply, per event, and have it persist across re-fetches.
+
 ## Known risks (snapshot, see README for detail)
 - org-caldav + iCloud + url.el: needs preemptive Basic auth; `org-caldav-check-connection`
   yields `DAV:status ""` (open).
