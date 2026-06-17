@@ -163,6 +163,7 @@ if(granted){
               end:ev.endDate.timeIntervalSince1970,
               allDay:ev.allDay,
               cal:(ev.calendar?ObjC.unwrap(ev.calendar.title):''),
+              uid:(ev.eventIdentifier?ObjC.unwrap(ev.eventIdentifier):''),
               notes:(ev.notes?ObjC.unwrap(ev.notes):''),
               recurring:(ev.hasRecurrenceRules?true:false)});
   }
@@ -185,6 +186,7 @@ Each: :title :start :end (Emacs time) :all-day :calendar :notes :recurring."
                     :end (seconds-to-time (alist-get 'end ev))
                     :all-day (eq (alist-get 'allDay ev) t)
                     :calendar (alist-get 'cal ev)
+                    :uid (alist-get 'uid ev)
                     :notes (alist-get 'notes ev)
                     :recurring (eq (alist-get 'recurring ev) t)))
             (alist-get 'events data))))
@@ -367,6 +369,121 @@ backend.
     (when (called-interactively-p 'any)
       (message "Calendar mirror: %d events → %s" (length evs) file))
     (length evs)))
+#+end_src
+
+* L3/L5 — Deadline ingest
+
+Scan read-only (subscribed/managed) calendars for *task-like* events, propose
+them, and on confirmation create a linked `NEXT` + `SCHEDULED` heading. The
+source calendar is never touched. Idempotent via `:APPLE_EVENT_ID:`.
+
+#+begin_src emacs-lisp :tangle yes
+(defcustom org-apple-calendar-ingest-calendars 'read-only
+  "Which calendars feed the deadline ingest.
+`read-only' = every non-writable (subscribed/managed) calendar; or a list of
+calendar title strings."
+  :type '(choice (const :tag "All read-only calendars" read-only)
+                 (repeat string))
+  :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-deadline-keywords
+  '("Abgabe" "Frist" "Deadline" "fällig" "Einsendeaufgabe" "Klassenfahrt"
+    "mitbringen" "zahlen" "bezahlen" "Einverständnis" "Einwilligung"
+    "Anmeldung" "anmelden" "Antrag" "Genehmigung" "Zettel")
+  "Case-insensitive substrings that mark a calendar event as a task candidate."
+  :type '(repeat string) :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-ingest-file nil
+  "Org file that ingested NEXT tasks are appended to (e.g. gtd/next.org).
+Must be set before `org-apple-calendar-ingest-deadlines' can create tasks."
+  :type '(choice (const nil) file) :group 'org-apple-calendar)
+
+(defcustom org-apple-calendar-ingest-days 60
+  "How many days ahead the deadline ingest scans."
+  :type 'integer :group 'org-apple-calendar)
+
+(defun org-apple-calendar--readonly-calendar-names ()
+  "Titles of all non-writable (subscribed/managed) calendars."
+  (delq nil (mapcar (lambda (c) (unless (plist-get c :writable)
+                                  (plist-get c :title)))
+                    (org-apple-calendar-list-calendars))))
+
+(defun org-apple-calendar--ingest-calendar-names ()
+  "Resolve `org-apple-calendar-ingest-calendars' to a list of titles."
+  (if (eq org-apple-calendar-ingest-calendars 'read-only)
+      (org-apple-calendar--readonly-calendar-names)
+    org-apple-calendar-ingest-calendars))
+
+(defun org-apple-calendar--deadline-candidate-p (ev)
+  "Non-nil if EV's title matches any `org-apple-calendar-deadline-keywords'."
+  (let ((title (or (plist-get ev :title) ""))
+        (case-fold-search t))
+    (seq-some (lambda (kw) (string-match-p (regexp-quote kw) title))
+              org-apple-calendar-deadline-keywords)))
+
+(defun org-apple-calendar--ingest-key (ev)
+  "Stable idempotency key for EV: UID@START-epoch."
+  (format "%s@%d" (or (plist-get ev :uid) "")
+          (floor (float-time (plist-get ev :start)))))
+
+(defun org-apple-calendar--already-ingested-p (key)
+  "Non-nil if KEY already appears in `org-apple-calendar-ingest-file'."
+  (let ((file org-apple-calendar-ingest-file))
+    (and file (file-exists-p file)
+         (with-temp-buffer
+           (insert-file-contents file)
+           (search-forward key nil t)))))
+
+(defun org-apple-calendar-ingest-candidates (&optional days)
+  "Return task-candidate events from the ingest calendars not yet ingested."
+  (let* ((days (or days org-apple-calendar-ingest-days))
+         (start (current-time))
+         (end (time-add start (days-to-time days)))
+         (cals (org-apple-calendar--ingest-calendar-names)))
+    (seq-filter
+     (lambda (ev)
+       (and (member (plist-get ev :calendar) cals)
+            (org-apple-calendar--deadline-candidate-p ev)
+            (not (org-apple-calendar--already-ingested-p
+                  (org-apple-calendar--ingest-key ev)))))
+     (org-apple-calendar-fetch-events start end))))
+
+(defun org-apple-calendar--create-ingest-task (ev)
+  "Append a linked NEXT + SCHEDULED heading for EV to the ingest file."
+  (let ((file org-apple-calendar-ingest-file))
+    (unless (and file (stringp file))
+      (user-error "Set `org-apple-calendar-ingest-file' first"))
+    (let ((sched (if (plist-get ev :all-day)
+                     (format-time-string "<%Y-%m-%d %a>" (plist-get ev :start))
+                   (format-time-string "<%Y-%m-%d %a %H:%M>" (plist-get ev :start)))))
+      (with-current-buffer (find-file-noselect file)
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (insert (format "* NEXT %s\n  SCHEDULED: %s\n  :PROPERTIES:\n  :APPLE_EVENT_ID: %s\n  :APPLE_CALENDAR: %s\n  :END:\n"
+                        (or (plist-get ev :title) "(Termin)")
+                        sched
+                        (org-apple-calendar--ingest-key ev)
+                        (or (plist-get ev :calendar) "")))
+        (save-buffer)))))
+
+(defun org-apple-calendar-ingest-deadlines (&optional days)
+  "Scan read-only calendars for task candidates; confirm each; create NEXT tasks.
+Created headings carry SCHEDULED = the event date and an `:APPLE_EVENT_ID:' so
+re-running never duplicates. The source calendar is never modified."
+  (interactive)
+  (let ((cands (org-apple-calendar-ingest-candidates days))
+        (made 0))
+    (if (null cands)
+        (message "Ingest: no new task candidates.")
+      (dolist (ev cands)
+        (when (y-or-n-p (format "Aufgabe anlegen? [%s] %s — %s "
+                                (plist-get ev :calendar)
+                                (format-time-string "%d.%m." (plist-get ev :start))
+                                (plist-get ev :title)))
+          (org-apple-calendar--create-ingest-task ev)
+          (cl-incf made)))
+      (message "Ingest: %d task(s) created in %s" made
+               (file-name-nondirectory (or org-apple-calendar-ingest-file "?"))))))
 #+end_src
 
 * Module footer
