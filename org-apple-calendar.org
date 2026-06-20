@@ -796,12 +796,13 @@ read-only org mirror via heading/timestamp/properties."
            (save-excursion
              (org-back-to-heading t)
              (let* ((title (org-get-heading t t t t))
+                    (heading-pos (point))
                     (end (save-excursion (org-end-of-subtree t t)))
                     uid cal tsstr)
                (save-excursion
                  (when (re-search-forward org-ts-regexp end t)
                    (setq tsstr (match-string 0)))
-                 (goto-char (line-beginning-position))
+                 (goto-char heading-pos)
                  (while (and (not (and uid cal))
                              (re-search-forward
                               "^[ \t]*:\\(APPLE_EVENT_UID\\|CALENDAR\\):[ \t]*\\(.*\\)$"
@@ -819,6 +820,33 @@ read-only org mirror via heading/timestamp/properties."
                      (setq ev-end (time-add start (seconds-to-time 3600))))
                    (list :title title :start start :end ev-end :all-day all-day
                          :calendar cal :uid uid :notes nil))))))))
+
+(defun org-apple-calendar-event-by-uid (uid &optional mirror-file)
+  "Return the mirrored Apple calendar event with UID.
+MIRROR-FILE defaults to `org-apple-calendar-mirror-file'.  This reads the
+generated mirror as input and does not contact EventKit."
+  (unless (and uid (stringp uid) (not (string-empty-p uid)))
+    (user-error "Event UID must be a non-empty string"))
+  (let ((file (or mirror-file org-apple-calendar-mirror-file)))
+    (unless (and file (file-readable-p file))
+      (user-error "Calendar mirror is not readable: %s" file))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (org-mode)
+      (goto-char (point-min))
+      (let ((pattern (format "^[ \t]*:APPLE_EVENT_UID:[ \t]*%s[ \t]*$"
+                             (regexp-quote uid))))
+        (or (catch 'found
+              (while (re-search-forward pattern nil t)
+                (let ((next-pos (match-end 0))
+                      event)
+                  (org-back-to-heading t)
+                  (setq event (org-apple-calendar--event-at-point))
+                  (when (and event (equal (plist-get event :uid) uid))
+                    (throw 'found event))
+                  (goto-char next-pos)))
+              nil)
+            (user-error "No event with UID in calendar mirror: %s" uid))))))
 
 (defun org-apple-calendar--adopt-key (ev)
   "Return a stable source-occurrence key for adopted event EV."
@@ -850,33 +878,34 @@ read-only org mirror via heading/timestamp/properties."
                       apple-uid
                       org-apple-calendar-target-calendar
                       (org-apple-calendar--event-timestamp ev)))
-      (save-buffer))))
+      (save-buffer)
+      (list :file file
+            :title (or (plist-get ev :title) "(Termin)")
+            :adopted-from-calendar (or (plist-get ev :calendar) "")
+            :adopted-from-uid (or (plist-get ev :uid) "")
+            :adopted-from-key key
+            :apple-event-id apple-uid
+            :apple-calendar org-apple-calendar-target-calendar))))
 
-(defun org-apple-calendar-adopt-event-at-point ()
-  "Adopt the Apple event at point into `org-apple-calendar-source-file'.
-
-The adopted appointment is created in `org-apple-calendar-target-calendar',
-linked back into `calendar.org' with `APPLE_EVENT_ID', and the original source
-event is marked `ignore' in the local override file so the mirror does not show
-both copies. For recurring source events, the override applies to the source UID
-and therefore hides all occurrences represented by that UID."
-  (interactive)
+(defun org-apple-calendar-adopt-event (ev &optional confirm)
+  "Adopt Apple calendar event EV into `org-apple-calendar-source-file'.
+When CONFIRM is non-nil, ask before creating the target Apple event.  Return a
+plist describing the adopted event, source override, and target Apple event."
   (unless (eq org-apple-calendar-write-backend 'eventkit)
     (user-error "Adopt requires the EventKit write backend"))
-  (let* ((ev (org-apple-calendar--event-at-point))
-         (source-uid (and ev (plist-get ev :uid)))
+  (let* ((source-uid (and ev (plist-get ev :uid)))
          (key (and ev (org-apple-calendar--adopt-key ev))))
     (unless ev
-      (user-error "No Apple calendar event at point"))
+      (user-error "No Apple calendar event"))
     (unless source-uid
-      (user-error "Event at point has no Apple UID"))
+      (user-error "Event has no Apple UID"))
     (when (string= (or (plist-get ev :calendar) "")
                    org-apple-calendar-target-calendar)
       (user-error "Event is already in target calendar `%s'"
                   org-apple-calendar-target-calendar))
     (when (org-apple-calendar--source-file-contains-key-p key)
       (user-error "This event occurrence is already adopted"))
-    (when (and (called-interactively-p 'any)
+    (when (and confirm
                (not (y-or-n-p
                      (format "Adopt '%s' into %s and ignore source? "
                              (or (plist-get ev :title) "(Termin)")
@@ -890,13 +919,49 @@ and therefore hides all occurrences represented by that UID."
                 (plist-get ev :notes))))
       (unless (plist-get res :uid)
         (user-error "Adopt failed: %s" (or (plist-get res :error) "unknown")))
-      (org-apple-calendar--append-adopted-appointment ev (plist-get res :uid))
-      (org-apple-calendar-set-event-role source-uid 'ignore)
-      (ignore-errors (org-apple-calendar-refresh-mirror))
-      (message "Adopted '%s' into %s and ignored source event"
-               (or (plist-get ev :title) "(Termin)")
-               org-apple-calendar-target-calendar)
-      (plist-get res :uid))))
+      (let* ((heading (org-apple-calendar--append-adopted-appointment
+                       ev (plist-get res :uid)))
+             (role (org-apple-calendar-set-event-role source-uid 'ignore)))
+        (ignore-errors (org-apple-calendar-refresh-mirror))
+        (message "Adopted '%s' into %s and ignored source event"
+                 (or (plist-get ev :title) "(Termin)")
+                 org-apple-calendar-target-calendar)
+        (list :kind 'org-apple-calendar-adoption
+              :title (or (plist-get ev :title) "(Termin)")
+              :source-calendar (or (plist-get ev :calendar) "")
+              :source-uid source-uid
+              :source-key key
+              :source-ignored (eq role 'ignore)
+              :target-calendar org-apple-calendar-target-calendar
+              :target-apple-event-id (plist-get res :uid)
+              :target-file org-apple-calendar-source-file
+              :heading heading
+              :override (list :file org-apple-calendar-overrides-file
+                              :event-uid source-uid
+                              :role role
+                              :changed t))))))
+
+(defun org-apple-calendar-adopt-event-by-uid (uid &optional mirror-file)
+  "Adopt mirrored Apple calendar event UID through the package-owned flow.
+MIRROR-FILE defaults to `org-apple-calendar-mirror-file'.  This is the
+non-interactive API for external runtimes such as `emacs-agent-runtime'."
+  (org-apple-calendar-adopt-event
+   (org-apple-calendar-event-by-uid uid mirror-file)))
+
+(defun org-apple-calendar-adopt-event-at-point ()
+  "Adopt the Apple event at point into `org-apple-calendar-source-file'.
+
+The adopted appointment is created in `org-apple-calendar-target-calendar',
+linked back into `calendar.org' with `APPLE_EVENT_ID', and the original source
+event is marked `ignore' in the local override file so the mirror does not show
+both copies. For recurring source events, the override applies to the source UID
+and therefore hides all occurrences represented by that UID."
+  (interactive)
+  (plist-get
+   (org-apple-calendar-adopt-event
+    (org-apple-calendar--event-at-point)
+    (called-interactively-p 'any))
+   :target-apple-event-id))
 
 (defconst org-apple-calendar--delete-script-template
   "ObjC.import('EventKit');

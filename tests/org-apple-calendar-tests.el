@@ -104,5 +104,76 @@
       (should (org-apple-calendar--appointment-differs-p
                appt (apple "A" 1000.0 2000.0 t))))))     ; all-day
 
+;;; --- provider API: adoption without reimplementing calendar writes ---------
+
+(defun org-apple-calendar-test--write-file (file text)
+  "Write TEXT to FILE, creating parent directories as needed."
+  (make-directory (file-name-directory file) t)
+  (with-temp-file file
+    (insert text)))
+
+(defun org-apple-calendar-test--mirror-text ()
+  "Return a tiny calendar mirror used by provider API tests."
+  "* Dentist
+  :PROPERTIES:
+  :CALENDAR: Private
+  :APPLE_EVENT_UID: dentist-1
+  :END:
+  <2026-06-20 Sat 09:00-10:00>
+")
+
+(ert-deftest org-apple-calendar-test-event-by-uid-reads-mirror ()
+  "`org-apple-calendar-event-by-uid' reads the generated mirror only."
+  (let* ((root (make-temp-file "oac-provider-" t))
+         (mirror (expand-file-name "calendar-mirror.org" root)))
+    (org-apple-calendar-test--write-file
+     mirror (org-apple-calendar-test--mirror-text))
+    (let ((event (org-apple-calendar-event-by-uid "dentist-1" mirror)))
+      (should (equal (plist-get event :title) "Dentist"))
+      (should (equal (plist-get event :calendar) "Private"))
+      (should (equal (plist-get event :uid) "dentist-1"))
+      (should-not (plist-get event :all-day)))))
+
+(ert-deftest org-apple-calendar-test-adopt-event-by-uid-uses-package-flow ()
+  "`org-apple-calendar-adopt-event-by-uid' owns target write and source ignore."
+  (let* ((root (make-temp-file "oac-provider-" t))
+         (mirror (expand-file-name "calendar-mirror.org" root))
+         (source (expand-file-name "calendar.org" root))
+         (overrides (expand-file-name "overrides.eld" root))
+         (org-apple-calendar-mirror-file mirror)
+         (org-apple-calendar-source-file source)
+         (org-apple-calendar-overrides-file overrides)
+         (org-apple-calendar-target-calendar "Org")
+         (org-apple-calendar-write-backend 'eventkit)
+         (org-apple-calendar--overrides 'unset)
+         created refresh-called)
+    (org-apple-calendar-test--write-file
+     mirror (org-apple-calendar-test--mirror-text))
+    (org-apple-calendar-test--write-file source "")
+    (cl-letf (((symbol-function 'org-apple-calendar--eventkit-create-event)
+               (lambda (&rest args)
+                 (setq created args)
+                 '(:uid "org-event-1" :mod 123)))
+              ((symbol-function 'org-apple-calendar-refresh-mirror)
+               (lambda (&optional _days)
+                 (setq refresh-called t)
+                 0)))
+      (let ((result (org-apple-calendar-adopt-event-by-uid "dentist-1" mirror)))
+        (should (equal (plist-get result :kind) 'org-apple-calendar-adoption))
+        (should (equal (plist-get result :source-uid) "dentist-1"))
+        (should (plist-get result :source-ignored))
+        (should (equal (plist-get result :target-apple-event-id) "org-event-1"))
+        (should (equal (plist-get result :target-file) source))
+        (should created)
+        (should refresh-called)
+        (with-temp-buffer
+          (insert-file-contents source)
+          (should (search-forward ":ADOPTED_FROM_UID: dentist-1" nil t))
+          (should (search-forward ":APPLE_EVENT_ID: org-event-1" nil t))
+          (should (search-forward ":APPLE_CALENDAR: Org" nil t)))
+        (with-temp-buffer
+          (insert-file-contents overrides)
+          (should (equal (read (current-buffer)) '(("dentist-1" . ignore)))))))))
+
 (provide 'org-apple-calendar-tests)
 ;;; org-apple-calendar-tests.el ends here

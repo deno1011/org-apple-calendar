@@ -58,9 +58,10 @@ task deadlines. This keeps it uncluttered and trustworthy.
    - a **deadline/task** → *proposed* as a GTD `SCHEDULED` task (you confirm).
 4. **Adoption is explicit.** If an external event should become part of your
    personal hard landscape, run `org-apple-calendar-adopt-event-at-point` from
-   the upcoming/mirror view. It copies that occurrence to `calendar.org`,
-   creates a linked event in the writable **"Org"** calendar, and marks the
-   source event `ignore` so the mirror does not show both copies.
+   the upcoming/mirror view, or call `org-apple-calendar-adopt-event-by-uid`
+   from an automation/runtime after review. Adoption copies that occurrence to
+   `calendar.org`, creates a linked event in the writable **"Org"** calendar,
+   and marks the source event `ignore` so the mirror does not show both copies.
 5. **"See only org."** You do **not** physically merge/delete managed calendars
    (impossible — the source re-syncs them). Instead: read them into org-agenda,
    adopt the few events you want in the visible "Org" calendar, and hide noisy
@@ -95,6 +96,9 @@ task deadlines. This keeps it uncluttered and trustworthy.
    the read-only intake layer, but `org-apple-calendar-adopt-event-at-point`
    promotes a chosen external occurrence into `calendar.org` and the writable
    "Org" calendar, then hides the source event from the mirror via override.
+   External AI runtimes should use the non-interactive
+   `org-apple-calendar-adopt-event-by-uid` API instead of writing
+   `calendar.org` or override files directly.
 
 Recurrence, all-day vs timed, and timezones are the real work of the EventKit
 write backend and are called out in `ARCHITECTURE.md`.

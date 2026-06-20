@@ -58,7 +58,9 @@ the whole point.
   added per-event overrides as the safety net for read-only third-party
   calendars; added an explicit adopt command so the AI/human can promote a
   mirrored appointment into `calendar.org` + the writable "Org" calendar without
-  hand-recreating all the implementation steps.
+  hand-recreating all the implementation steps; exposed
+  `org-apple-calendar-adopt-event-by-uid` so AI runtimes can delegate adoption
+  to this package instead of duplicating calendar writes.
 - **Hard debugging.** The org-caldav/`url.el` saga (iCloud needs preemptive
   Basic auth; `org-caldav-check-connection` yields `DAV:status ""`), EventKit
   permission prompts, Keychain port-443 matching, elpaca's async `:config`,
