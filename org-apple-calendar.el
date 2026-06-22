@@ -1,7 +1,7 @@
 ;;; org-apple-calendar.el --- Read Apple Calendar (EventKit) into org -*- lexical-binding: t; -*-
 ;;
 ;; Author: Denis Butic
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Keywords: calendar, outlines
 ;; Package-Requires: ((emacs "29.1"))
 ;;
@@ -90,6 +90,45 @@ Signals a `user-error' if Calendar access is not granted."
       ;; calendars (default busy); later calls append any new ones.
       (org-apple-calendar--sync-classification cals)
       cals)))
+
+(defconst org-apple-calendar--ensure-calendar-template
+  "ObjC.import('EventKit');
+var store=$.EKEventStore.alloc.init;
+var done=false,granted=false,out={};
+store.requestAccessToEntityTypeCompletion($.EKEntityTypeEvent,function(g){granted=g;done=true;});
+var it=0,max=%d;
+while(!done&&it<max){$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));it++;}
+out.granted=granted;
+if(granted){
+  var cals=store.calendarsForEntityType($.EKEntityTypeEvent),found=null;
+  for(var i=0;i<cals.count;i++){var c=cals.objectAtIndex(i);if(ObjC.unwrap(c.title)===%s){found=c;break;}}
+  if(found){out.exists=true;out.id=ObjC.unwrap(found.calendarIdentifier);}
+  else{try{
+    var cal=$.EKCalendar.calendarForEntityTypeEventStore($.EKEntityTypeEvent,store);
+    cal.title=%s;
+    cal.source=store.defaultCalendarForNewEvents.source;
+    var err=Ref();
+    out.created=store.saveCalendarCommitError(cal,true,err);
+    out.id=ObjC.unwrap(cal.calendarIdentifier);
+  }catch(e){out.err=String(e);}}
+}
+JSON.stringify(out);"
+  "JXA template; %d = run-loop iterations, then two %s = calendar name (JSON).")
+
+(defun org-apple-calendar-ensure-calendar (name)
+  "Ensure an Apple event calendar named NAME exists, creating it if absent.
+Public, idempotent.  A newly created calendar inherits the default
+new-event source (usually iCloud, so it syncs to all devices).  Returns an
+alist: `exists' t when already present, else `created'/`id' (or `err').
+Signals a `user-error' if Calendar access is not granted."
+  (require 'json)
+  (let* ((script (format org-apple-calendar--ensure-calendar-template
+                         (* 10 org-apple-calendar-access-timeout)
+                         (json-encode name) (json-encode name)))
+         (data (org-apple-calendar--jxa-run-json script)))
+    (unless (eq (alist-get 'granted data) t)
+      (user-error "Calendar access not granted (approve the macOS prompt for Emacs)"))
+    data))
 
 (defun org-apple-calendar-show-calendars ()
   "Display all Apple calendars classified as owned (writable) vs read-only."
