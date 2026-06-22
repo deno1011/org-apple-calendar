@@ -16,6 +16,9 @@
 ;;; Code:
 
 (require 'json)
+(require 'cl-lib)
+(require 'org)
+(require 'subr-x)
 
 (defgroup org-apple-calendar nil
   "Read Apple Calendar (EventKit) into org."
@@ -427,6 +430,26 @@ intervals from `org-apple-calendar-free-busy'."
         (concat (format-time-string "<%Y-%m-%d %a %H:%M>--" bs)
                 (format-time-string "<%Y-%m-%d %a %H:%M>" be))))))
 
+(defun org-apple-calendar--recurrence-suffix (recurrence)
+  "Return an Org repeater suffix for RECURRENCE, or nil."
+  (when recurrence
+    (let ((interval (or (plist-get recurrence :interval) 1)))
+      (pcase (plist-get recurrence :freq)
+        ('daily (format "+%dd" interval))
+        ('weekly (format "+%dw" interval))
+        ('monthly (format "+%dm" interval))
+        ('yearly (format "+%dy" interval))
+        (_ nil)))))
+
+(defun org-apple-calendar--event-timestamp-with-recurrence (ev recurrence)
+  "Return an active timestamp for EV with optional RECURRENCE."
+  (let ((timestamp (org-apple-calendar--event-timestamp ev))
+        (suffix (org-apple-calendar--recurrence-suffix recurrence)))
+    (if (and suffix
+             (string-match-p "\\`<[^>]+>\\'" timestamp))
+        (replace-regexp-in-string ">\\'" (concat " " suffix ">") timestamp)
+      timestamp)))
+
 (defun org-apple-calendar-refresh-mirror (&optional days)
   "Regenerate `org-apple-calendar-mirror-file' for the next DAYS and add it to
 `org-agenda-files'. Returns the event count."
@@ -607,6 +630,75 @@ re-running never duplicates. The source calendar is never modified."
   "Org file whose active-timestamp headings are pushed as appointments."
   :type '(choice (const nil) file) :group 'org-apple-calendar)
 
+(defun org-apple-calendar--clean-one-line (value fallback)
+  "Return VALUE as one safe Org line, or FALLBACK."
+  (let ((text (string-trim (or value ""))))
+    (if (string-empty-p text)
+        fallback
+      (replace-regexp-in-string "[\n\r]+" " " text))))
+
+(defun org-apple-calendar--time-input (value name)
+  "Return VALUE as an Emacs time, or signal with NAME."
+  (cond
+   ((numberp value) (seconds-to-time value))
+   ((and (consp value) (numberp (car value))) value)
+   ((and (stringp value)
+         (not (string-empty-p (string-trim value))))
+    (condition-case nil
+        (date-to-time value)
+      (error (user-error "%s must be a parseable date/time: %S" name value))))
+   (t (user-error "%s must be a time, epoch seconds, or date/time string" name))))
+
+(defun org-apple-calendar--recurrence-input (value)
+  "Return VALUE as a recurrence plist, or nil."
+  (cond
+   ((null value) nil)
+   ((and (listp value) (plist-get value :freq))
+    (let ((freq (plist-get value :freq)))
+      (list :freq (if (stringp freq) (intern (downcase freq)) freq)
+            :interval (or (plist-get value :interval) 1))))
+   ((symbolp value) (list :freq value :interval 1))
+   ((and (stringp value)
+         (not (string-empty-p (string-trim value))))
+    (let ((freq (intern (downcase (string-trim value)))))
+      (unless (memq freq '(daily weekly monthly yearly))
+        (user-error "Unsupported recurrence frequency: %S" value))
+      (list :freq freq :interval 1)))
+   (t (user-error "Unsupported recurrence value: %S" value))))
+
+(defun org-apple-calendar--append-created-appointment
+    (title start end all-day notes recurrence apple-uid apple-mod)
+  "Append a newly created appointment heading and return heading metadata."
+  (let ((file org-apple-calendar-source-file)
+        (title (org-apple-calendar--clean-one-line title "(Termin)"))
+        (notes (and notes (string-trim notes))))
+    (unless (and file (stringp file))
+      (user-error "Set `org-apple-calendar-source-file' first"))
+    (make-directory (file-name-directory file) t)
+    (with-current-buffer (find-file-noselect file)
+      (goto-char (point-max))
+      (unless (bolp) (insert "\n"))
+      (let ((pos (point))
+            (timestamp
+             (org-apple-calendar--event-timestamp-with-recurrence
+              (list :start start :end end :all-day all-day)
+              recurrence)))
+        (insert (format "* %s\n  :PROPERTIES:\n  :APPLE_EVENT_ID: %s\n  :APPLE_CALENDAR: %s\n"
+                        title apple-uid org-apple-calendar-target-calendar))
+        (when apple-mod
+          (insert (format "  :APPLE_MOD: %s\n" (number-to-string apple-mod))))
+        (insert "  :CREATED_BY: org-apple-calendar\n  :END:\n"
+                "  " timestamp "\n")
+        (when (and notes (not (string-empty-p notes)))
+          (insert "\n" notes "\n"))
+        (save-buffer)
+        (list :file file
+              :position pos
+              :title title
+              :timestamp timestamp
+              :apple-event-id apple-uid
+              :apple-calendar org-apple-calendar-target-calendar)))))
+
 (defconst org-apple-calendar--create-script-template
   "ObjC.import('EventKit');
 var store=$.EKEventStore.alloc.init;
@@ -658,6 +750,54 @@ yearly :interval N) or nil. Return plist with :uid on success or :error."
      ((not (eq (alist-get 'granted data) t)) (list :error "no-access"))
      ((alist-get 'uid res) (list :uid (alist-get 'uid res) :mod (alist-get 'mod res)))
      (t (list :error (or (alist-get 'err res) "unknown"))))))
+
+(defun org-apple-calendar-create-appointment
+    (title start end &optional all-day notes recurrence refresh-mirror)
+  "Create one appointment in Apple Calendar and `calendar.org'.
+TITLE is the heading/event title.  START and END may be Emacs times, epoch
+seconds, or date/time strings accepted by `date-to-time'.  ALL-DAY is non-nil
+for all-day events.  NOTES becomes both Apple notes and body text in the Org
+heading.  RECURRENCE may be nil, a frequency symbol/string (`daily', `weekly',
+`monthly', `yearly'), or a plist (:freq FREQ :interval N).
+
+The write is package-owned: this function writes only to
+`org-apple-calendar-target-calendar' and links the resulting
+`:APPLE_EVENT_ID:' into `org-apple-calendar-source-file'."
+  (unless (eq org-apple-calendar-write-backend 'eventkit)
+    (user-error "Create appointment requires the EventKit write backend"))
+  (let* ((title (org-apple-calendar--clean-one-line title "(Termin)"))
+         (start-time (org-apple-calendar--time-input start "start"))
+         (end-time (org-apple-calendar--time-input end "end"))
+         (start-seconds (float-time start-time))
+         (end-seconds (float-time end-time))
+         (recurrence (org-apple-calendar--recurrence-input recurrence))
+         (notes (and notes (string-trim notes))))
+    (unless (> end-seconds start-seconds)
+      (user-error "end must be after start"))
+    (let ((res (org-apple-calendar--eventkit-create-event
+                title start-seconds end-seconds all-day notes recurrence)))
+      (unless (plist-get res :uid)
+        (user-error "Create appointment failed: %s"
+                    (or (plist-get res :error) "unknown")))
+      (let ((heading
+             (org-apple-calendar--append-created-appointment
+              title start-time end-time all-day notes recurrence
+              (plist-get res :uid)
+              (plist-get res :mod))))
+        (when refresh-mirror
+          (ignore-errors (org-apple-calendar-refresh-mirror)))
+        (list :kind 'org-apple-calendar-created-appointment
+              :title title
+              :start start-seconds
+              :end end-seconds
+              :all-day (and all-day t)
+              :notes notes
+              :recurrence recurrence
+              :target-calendar org-apple-calendar-target-calendar
+              :target-apple-event-id (plist-get res :uid)
+              :target-file org-apple-calendar-source-file
+              :heading heading
+              :mirror-refreshed (and refresh-mirror t))))))
 
 (defun org-apple-calendar--timestamp-recurrence (ts)
   "Return a recurrence plist (:freq :interval) for org timestamp TS, or nil.

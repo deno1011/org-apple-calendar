@@ -62,20 +62,25 @@ task deadlines. This keeps it uncluttered and trustworthy.
    from an automation/runtime after review. Adoption copies that occurrence to
    `calendar.org`, creates a linked event in the writable **"Org"** calendar,
    and marks the source event `ignore` so the mirror does not show both copies.
-5. **"See only org."** You do **not** physically merge/delete managed calendars
+5. **AI-created appointments use the package API.** External runtimes should
+   call `org-apple-calendar-create-appointment` instead of formatting
+   `calendar.org` themselves. The package creates the EventKit appointment in
+   the writable **"Org"** calendar, appends the linked Org heading with
+   `APPLE_EVENT_ID`, and can refresh the mirror afterwards.
+6. **"See only org."** You do **not** physically merge/delete managed calendars
    (impossible — the source re-syncs them). Instead: read them into org-agenda,
    adopt the few events you want in the visible "Org" calendar, and hide noisy
    calendars in Calendar.app's sidebar. Same effect, robust, reversible.
-6. **Availability** ("when am I free") is computed by reading **all** calendars
+7. **Availability** ("when am I free") is computed by reading **all** calendars
    (busy intervals), not just "Org".
-7. **Events have a role, not just a time:** `busy` (blocks my time), `info`
+8. **Events have a role, not just a time:** `busy` (blocks my time), `info`
    (time-bound context — a colleague's slot, a custody week, school — shown but
    never blocking), or `ignore`. Role = per-event **override** (set in the GTD
    view, persisted) > per-calendar policy > Apple "Show As" availability >
    default busy. Only `busy` events reduce free slots. See `ARCHITECTURE.md`
    → *Event classification & roles*. The override exists because read-only
    third-party calendars can't be fixed at the source.
-8. **Date convention** (shipped in `org-apple-reminders` v1.16): org `SCHEDULED`
+9. **Date convention** (shipped in `org-apple-reminders` v1.16): org `SCHEDULED`
    ⇄ Apple due date. Apple shows an item on its due day (like `SCHEDULED`), not
    ahead of time (like `DEADLINE`). `DEADLINE` is not synced.
 
@@ -99,6 +104,15 @@ task deadlines. This keeps it uncluttered and trustworthy.
    External AI runtimes should use the non-interactive
    `org-apple-calendar-adopt-event-by-uid` API instead of writing
    `calendar.org` or override files directly.
+4. **Create — AI/runtime appointment → Org-owned appointment.** New
+   appointments from EAR or another runtime should use
+   `org-apple-calendar-create-appointment`. It creates exactly one EventKit
+   event in the configured target calendar, writes the linked Org heading, and
+   optionally refreshes the mirror. Simple recurrence is supported at creation
+   time (`daily`, `weekly`, `monthly`, `yearly`), but the current two-way sync
+   deliberately leaves recurring event updates alone; change recurring series
+   in Apple Calendar or recreate them through the API until recurring update
+   semantics are explicitly implemented.
 
 Recurrence, all-day vs timed, and timezones are the real work of the EventKit
 write backend and are called out in `ARCHITECTURE.md`.

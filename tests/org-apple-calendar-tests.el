@@ -175,5 +175,70 @@
           (insert-file-contents overrides)
           (should (equal (read (current-buffer)) '(("dentist-1" . ignore)))))))))
 
+(ert-deftest org-apple-calendar-test-create-appointment-uses-package-flow ()
+  "`org-apple-calendar-create-appointment' owns EventKit and calendar.org writes."
+  (let* ((root (make-temp-file "oac-create-" t))
+         (source (expand-file-name "calendar.org" root))
+         (org-apple-calendar-source-file source)
+         (org-apple-calendar-target-calendar "Org")
+         (org-apple-calendar-write-backend 'eventkit)
+         created refresh-called)
+    (org-apple-calendar-test--write-file source "#+TITLE: Calendar\n")
+    (cl-letf (((symbol-function 'org-apple-calendar--eventkit-create-event)
+               (lambda (&rest args)
+                 (setq created args)
+                 '(:uid "created-1" :mod 456)))
+              ((symbol-function 'org-apple-calendar-refresh-mirror)
+               (lambda (&optional _days)
+                 (setq refresh-called t)
+                 1)))
+      (let ((result (org-apple-calendar-create-appointment
+                     "Focus block"
+                     "2026-06-22 09:00"
+                     "2026-06-22 10:30"
+                     nil
+                     "Deep work"
+                     nil
+                     t)))
+        (should (equal (plist-get result :kind)
+                       'org-apple-calendar-created-appointment))
+        (should (equal (plist-get result :target-apple-event-id)
+                       "created-1"))
+        (should refresh-called)
+        (should (equal (nth 0 created) "Focus block"))
+        (should (equal (nth 4 created) "Deep work"))
+        (with-temp-buffer
+          (insert-file-contents source)
+          (should (search-forward "* Focus block" nil t))
+          (should (search-forward ":APPLE_EVENT_ID: created-1" nil t))
+          (should (search-forward ":APPLE_CALENDAR: Org" nil t))
+          (should (search-forward ":APPLE_MOD: 456" nil t))
+          (should (search-forward "<2026-06-22 Mon 09:00-10:30>" nil t))
+          (should (search-forward "Deep work" nil t)))))))
+
+(ert-deftest org-apple-calendar-test-create-appointment-weekly-recurrence ()
+  "`org-apple-calendar-create-appointment' records simple recurrence in Org."
+  (let* ((root (make-temp-file "oac-create-recur-" t))
+         (source (expand-file-name "calendar.org" root))
+         (org-apple-calendar-source-file source)
+         (org-apple-calendar-target-calendar "Org")
+         (org-apple-calendar-write-backend 'eventkit)
+         created)
+    (org-apple-calendar-test--write-file source "")
+    (cl-letf (((symbol-function 'org-apple-calendar--eventkit-create-event)
+               (lambda (&rest args)
+                 (setq created args)
+                 '(:uid "weekly-1" :mod 789))))
+      (org-apple-calendar-create-appointment
+       "Weekly planning"
+       "2026-06-22 08:00"
+       "2026-06-22 08:30"
+       nil nil '(:freq weekly :interval 1))
+      (should (equal (nth 5 created) '(:freq weekly :interval 1)))
+      (with-temp-buffer
+        (insert-file-contents source)
+        (should (search-forward
+                 "<2026-06-22 Mon 08:00-08:30 +1w>" nil t))))))
+
 (provide 'org-apple-calendar-tests)
 ;;; org-apple-calendar-tests.el ends here
