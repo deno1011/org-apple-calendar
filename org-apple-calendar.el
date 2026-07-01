@@ -379,6 +379,53 @@ New calendars are added as `busy'; existing roles are preserved."
   (org-apple-calendar--sync-classification (org-apple-calendar-list-calendars))
   (find-file org-apple-calendar-classification-file))
 
+(defun org-apple-calendar-normalize-role (role &optional allow-clear)
+  "Return ROLE as `busy', `info', `ignore', or nil when ALLOW-CLEAR.
+ROLE may be a symbol or string.  Signal a `user-error' for invalid roles."
+  (let ((value (cond
+                ((null role) nil)
+                ((symbolp role) role)
+                ((stringp role)
+                 (if (string-empty-p role) nil (intern role)))
+                (t role))))
+    (cond
+     ((memq value '(busy info ignore)) value)
+     ((and allow-clear (or (null value) (eq value 'clear))) nil)
+     (t (user-error "Role must be busy, info, or ignore%s"
+                    (if allow-clear ", or clear" ""))))))
+
+(defun org-apple-calendar-event-role (event)
+  "Return the effective busy/info/ignore role for EVENT."
+  (org-apple-calendar--event-role event))
+
+(defun org-apple-calendar-calendar-classifications (&optional sync)
+  "Return per-calendar classifications as plists.
+When SYNC is non-nil, first append new calendars from Apple Calendar to
+`org-apple-calendar-classification-file' as `busy'."
+  (when sync
+    (org-apple-calendar--sync-classification (org-apple-calendar-list-calendars)))
+  (let ((classifications (copy-alist (org-apple-calendar--load-classification))))
+    (mapcar (lambda (entry)
+              (list :calendar (car entry)
+                    :role (cdr entry)))
+            (sort classifications
+                  (lambda (a b) (string< (car a) (car b)))))))
+
+(defun org-apple-calendar-set-calendar-role (calendar role)
+  "Persist ROLE for CALENDAR in `org-apple-calendar-classification-file'."
+  (unless org-apple-calendar-classification-file
+    (user-error "Set `org-apple-calendar-classification-file' first"))
+  (unless (and (stringp calendar) (not (string-empty-p calendar)))
+    (user-error "Calendar name is required"))
+  (let* ((role (org-apple-calendar-normalize-role role))
+         (current (copy-alist (org-apple-calendar--load-classification)))
+         (updated (cons (cons calendar role)
+                        (assoc-delete-all calendar current))))
+    (org-apple-calendar--save-classification updated)
+    (list :calendar calendar
+          :role role
+          :file org-apple-calendar-classification-file)))
+
 (defcustom org-apple-calendar-day-window '(9 . 21)
   "Daily availability window as (START-HOUR . END-HOUR), local time."
   :type '(cons integer integer) :group 'org-apple-calendar)

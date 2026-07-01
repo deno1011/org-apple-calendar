@@ -177,6 +177,22 @@ calendars you cannot fix classification at the source, and maintaining correct
 "Show As" on every event by hand is unrealistic — so the GTD side must be able
 to overrule, cheaply, per event, and have it persist across re-fetches.
 
+Provider APIs for agents and other non-interactive callers:
+
+- `org-apple-calendar-calendar-classifications` lists the persisted
+  per-calendar `busy`/`info`/`ignore` policy and can sync newly discovered
+  calendars into the private classification file as default `busy`.
+- `org-apple-calendar-set-calendar-role` updates one whole calendar policy.
+- `org-apple-calendar-event-role` exposes the effective role decision for one
+  event.
+- `org-apple-calendar-set-event-role` updates the authoritative per-event
+  override.
+
+AI callers should inspect classifications and upcoming events before planning
+free time, then write only clear corrections: use `busy` for time the user
+actually cannot use, `info` for context that should not block, and `ignore` for
+noise.
+
 ## Event adoption (external event → Org hard landscape)
 
 The mirror is the AI/GTD intake layer; `calendar.org` is the writable personal

@@ -175,6 +175,54 @@
           (insert-file-contents overrides)
           (should (equal (read (current-buffer)) '(("dentist-1" . ignore)))))))))
 
+(ert-deftest org-apple-calendar-test-calendar-classification-public-api ()
+  "Public classification APIs persist busy/info/ignore roles."
+  (let* ((root (make-temp-file "oac-classification-" t))
+         (classification (expand-file-name "calendar-classification.eld" root))
+         (org-apple-calendar-classification-file classification)
+         (org-apple-calendar--classification 'unset))
+    (should-error
+     (org-apple-calendar-normalize-role 'free)
+     :type 'user-error)
+    (should (eq (org-apple-calendar-normalize-role "info") 'info))
+    (should-not (org-apple-calendar-normalize-role "clear" t))
+    (should (equal (org-apple-calendar-set-calendar-role "School" 'info)
+                   (list :calendar "School"
+                         :role 'info
+                         :file classification)))
+    (should (equal (org-apple-calendar-set-calendar-role "Week Numbers" "ignore")
+                   (list :calendar "Week Numbers"
+                         :role 'ignore
+                         :file classification)))
+    (should (equal (org-apple-calendar-calendar-classifications)
+                   '((:calendar "School" :role info)
+                     (:calendar "Week Numbers" :role ignore))))
+    (with-temp-buffer
+      (insert-file-contents classification)
+      (let ((data (read (current-buffer))))
+        (should (equal (cdr (assoc "School" data)) 'info))
+        (should (equal (cdr (assoc "Week Numbers" data)) 'ignore))))))
+
+(ert-deftest org-apple-calendar-test-event-role-public-api ()
+  "`org-apple-calendar-event-role' exposes the effective role decision."
+  (let* ((root (make-temp-file "oac-event-role-" t))
+         (classification (expand-file-name "calendar-classification.eld" root))
+         (overrides (expand-file-name "overrides.eld" root))
+         (org-apple-calendar-classification-file classification)
+         (org-apple-calendar-overrides-file overrides)
+         (org-apple-calendar--classification 'unset)
+         (org-apple-calendar--overrides 'unset))
+    (org-apple-calendar-set-calendar-role "School" 'info)
+    (should (eq (org-apple-calendar-event-role
+                 (list :uid "event-1" :calendar "School"))
+                'info))
+    (should (eq (org-apple-calendar-set-event-role "event-1" 'ignore)
+                'ignore))
+    (setq org-apple-calendar--overrides 'unset)
+    (should (eq (org-apple-calendar-event-role
+                 (list :uid "event-1" :calendar "School"))
+                'ignore))))
+
 (ert-deftest org-apple-calendar-test-create-appointment-uses-package-flow ()
   "`org-apple-calendar-create-appointment' owns EventKit and calendar.org writes."
   (let* ((root (make-temp-file "oac-create-" t))
